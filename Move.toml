@@ -1,0 +1,28 @@
+[package]
+name = "altheia_sui"
+edition = "2024.beta"
+version = "0.1.0"
+license = "Apache-2.0"
+authors = ["altheia-xyz <hi@altheia.xyz>"]
+
+# altheia_sui — Move implementation of the (sui, move-policy-object) substrate
+# under altheia's chain-agnostic + substrate-agnostic policy plane.
+#
+# Implements the 4-method substrate-adapter contract v1.0 defined at
+# altheia-plan/02_SRS/substrate-adapter/CONTRACT.md
+#
+# Modules:
+#   policy::Policy     per-agent capability object (caps + scope + revocation)
+#   agent::AgentCap    capability the agent's signing path consumes
+#   audit::Anchor      on-chain audit event emission
+#
+# Target: Sui Overflow 2026 Agentic Web sub-track 2 submission 2026-06-20.
+
+[dependencies]
+
+[addresses]
+altheia = "0x0"
+
+[dev-dependencies]
+
+[dev-addresses]
