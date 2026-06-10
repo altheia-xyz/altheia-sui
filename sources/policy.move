@@ -1,50 +1,30 @@
 /// altheia::policy
 ///
-/// Per-agent capability object encoding policy DSL constraints for the
-/// (sui, move-policy-object) substrate.
+/// Per-agent policy as a SHARED object. Holds caps + scope + cumulative
+/// spend state. Because Policy is shared, the daily window state
+/// persists across PTBs — closes the per-PTB splitting hole the 4-lens
+/// review identified.
 ///
-/// Implements `provision` and `revoke` from the substrate-adapter contract v1.0
-/// (see altheia-plan/02_SRS/substrate-adapter/CONTRACT.md).
-///
-/// Status: skeleton. Function bodies + tests land May 23-28 per
-/// altheia-plan/01_PHASES/sui/SHIP_PLAN_2026_05_22.md.
+/// `check_and_consume` is the enforcement gate, called by
+/// vault::withdraw_with_receipt before any Coin leaves the vault.
 module altheia::policy;
 
-use sui::object::{Self, UID, ID};
-use sui::tx_context::{Self, TxContext};
-use sui::transfer;
-use std::vector;
+use sui::clock::{Self, Clock};
+use altheia::agent::{Self, AgentCap};
+use altheia::audit;
 
-/// Owner capability returned to the operator at `provision` time.
-/// Holding this is the only way to revoke or update the linked `Policy`.
-public struct OwnerCap has key, store {
-    id: UID,
-    policy_id: ID,
-}
-
-/// Per-agent policy capability. Lives at a Sui object ID known to the
-/// operator + agent. The agent's signing path consumes a reference to this
-/// object before every action; on-chain enforcement happens here.
+/// Per-agent policy object. Shared at mint via vault::mint_policy.
 public struct Policy has key {
     id: UID,
-    /// Agent identifier this policy is bound to.
     agent_id: vector<u8>,
-    /// Per-transaction cap (in smallest unit of the token).
     per_tx_cap: u64,
-    /// Per-day cap.
     per_day_cap: u64,
-    /// Allowed package addresses the agent can call into.
     allowed_packages: vector<address>,
-    /// Expiry epoch in milliseconds. Past this, the cap is dead.
     expires_at_ms: u64,
-    /// Spent amount within the current day window.
     spent_today: u64,
-    /// Day-window start epoch ms; rolls over on consume.
     day_window_started_ms: u64,
-    /// Revoked flag. Once true, every consume aborts.
     revoked: bool,
-    /// Monotonic policy version. Incremented on every update + revoke.
-    /// Required for incident-replay (Phase 1.6 feature).
+    paused: bool,
     version: u64,
 }
 
@@ -52,76 +32,151 @@ public struct Policy has key {
 
 const EPolicyRevoked: u64 = 1;
 const EPolicyExpired: u64 = 2;
-const ECapExceeded: u64 = 3;
-const EPackageNotAllowed: u64 = 4;
-const ENotOwner: u64 = 5;
+const EPolicyPaused: u64 = 3;
+const ECapExceededPerTx: u64 = 4;
+const ECapExceededPerDay: u64 = 5;
+const EPackageNotAllowed: u64 = 6;
+const EWrongPolicy: u64 = 7;
 
-// === Entry functions ===
+const MS_PER_DAY: u64 = 86_400_000;
 
-/// Provision a new policy capability for `agent_id` with the given caps + scope.
-/// Returns the policy to a shared object so the agent can consume it; returns
-/// the OwnerCap to the operator who provisioned it.
-///
-/// Mirrors `SubstrateAdapter::provision(policy)` from CONTRACT.md.
-public fun mint(
-    _agent_id: vector<u8>,
-    _per_tx_cap: u64,
-    _per_day_cap: u64,
-    _allowed_packages: vector<address>,
-    _expires_at_ms: u64,
-    _ctx: &mut TxContext,
-): OwnerCap {
-    // TODO(May 23-25): construct Policy + share it; return OwnerCap to caller.
-    // Stub: aborts so the function is unimplemented but the signature compiles.
-    abort 0
+// === Package-visible constructors (called by vault front-door) ===
+
+public(package) fun new(
+    agent_id: vector<u8>,
+    per_tx_cap: u64,
+    per_day_cap: u64,
+    allowed_packages: vector<address>,
+    expires_at_ms: u64,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): Policy {
+    let now = clock::timestamp_ms(clock);
+    Policy {
+        id: object::new(ctx),
+        agent_id,
+        per_tx_cap,
+        per_day_cap,
+        allowed_packages,
+        expires_at_ms,
+        spent_today: 0,
+        day_window_started_ms: now,
+        revoked: false,
+        paused: false,
+        version: 1,
+    }
 }
 
-/// Update the caps on an existing policy. Owner-gated.
-public fun update_caps(
-    _policy: &mut Policy,
-    _owner: &OwnerCap,
-    _new_per_tx: u64,
-    _new_per_day: u64,
+/// Construct + share a Policy. Returns the policy's ID so the caller
+/// (vault::mint_policy) can pass it to mint_agent_cap and to clients.
+/// Policy is `key` only — share_object can only be called from within
+/// this module.
+public(package) fun mint_and_share(
+    agent_id: vector<u8>,
+    per_tx_cap: u64,
+    per_day_cap: u64,
+    allowed_packages: vector<address>,
+    expires_at_ms: u64,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): ID {
+    let p = new(agent_id, per_tx_cap, per_day_cap, allowed_packages, expires_at_ms, clock, ctx);
+    let pid = object::id(&p);
+    transfer::share_object(p);
+    pid
+}
+
+public(package) fun set_caps(
+    policy: &mut Policy,
+    new_per_tx_cap: u64,
+    new_per_day_cap: u64,
+    clock: &Clock,
 ) {
-    // TODO(May 25-26): authorize via owner_cap.policy_id == object::id(policy),
-    // mutate caps, bump version.
-    abort 0
+    let before = policy.version;
+    policy.per_tx_cap = new_per_tx_cap;
+    policy.per_day_cap = new_per_day_cap;
+    policy.version = before + 1;
+    audit::emit_updated(
+        policy.agent_id,
+        before,
+        policy.version,
+        clock::timestamp_ms(clock),
+    );
 }
 
-/// Revoke the policy capability. Owner-gated. Bumps version.
-/// Once revoked, all subsequent `consume` calls abort.
-///
-/// Mirrors `SubstrateAdapter::revoke(token)` from CONTRACT.md.
-public fun revoke(_policy: &mut Policy, _owner: &OwnerCap) {
-    // TODO(May 26): assert owner; set revoked = true; bump version.
-    abort 0
+public(package) fun set_revoked(policy: &mut Policy, clock: &Clock) {
+    let before = policy.version;
+    policy.revoked = true;
+    policy.version = before + 1;
+    audit::emit_revoked(
+        policy.agent_id,
+        policy.version,
+        clock::timestamp_ms(clock),
+    );
 }
 
-/// Consume the policy capability for a proposed action. Aborts if any cap
-/// is violated or the policy is revoked / expired / package not allowed.
+public(package) fun set_paused(policy: &mut Policy, paused: bool, clock: &Clock) {
+    let before = policy.version;
+    policy.paused = paused;
+    policy.version = before + 1;
+    audit::emit_updated(
+        policy.agent_id,
+        before,
+        policy.version,
+        clock::timestamp_ms(clock),
+    );
+}
+
+// === Enforcement gate ===
+
+/// Aborts on any rule failure; updates spent_today + day window on
+/// success; emits AllowedAction on success.
 ///
-/// Called by `agent::AgentCap::consume`, never directly. Encodes the
-/// substrate-side `enforce` behavior the SDK's `enforce` method mirrors
-/// off-chain.
-public(package) fun consume(
-    _policy: &mut Policy,
-    _amount: u64,
-    _target_package: address,
-    _now_ms: u64,
+/// Denied paths abort — aborts roll back all effects, so the indexer
+/// learns of denials from transaction failure metadata, not from an
+/// on-chain emit (emitting before abort is rolled back anyway).
+public(package) fun check_and_consume(
+    policy: &mut Policy,
+    cap: &AgentCap,
+    amount: u64,
+    target_package: address,
+    clock: &Clock,
 ) {
-    // TODO(May 29-30): full enforcement path.
-    //   1. assert !revoked, else EPolicyRevoked
-    //   2. assert now_ms < expires_at_ms, else EPolicyExpired
-    //   3. assert amount <= per_tx_cap, else ECapExceeded
-    //   4. roll daily window if now_ms > day_window_started_ms + 86_400_000
-    //   5. assert spent_today + amount <= per_day_cap, else ECapExceeded
-    //   6. assert vector::contains(&allowed_packages, &target_package), else EPackageNotAllowed
-    //   7. spent_today += amount
-    abort 0
+    assert!(agent::policy_id(cap) == object::id(policy), EWrongPolicy);
+    assert!(!policy.revoked, EPolicyRevoked);
+    assert!(!policy.paused, EPolicyPaused);
+
+    let now = clock::timestamp_ms(clock);
+    assert!(now < policy.expires_at_ms, EPolicyExpired);
+
+    assert!(amount <= policy.per_tx_cap, ECapExceededPerTx);
+    assert!(policy.allowed_packages.contains(&target_package), EPackageNotAllowed);
+
+    // Roll the daily window if it's been ≥ 24h since it started.
+    if (now >= policy.day_window_started_ms + MS_PER_DAY) {
+        policy.day_window_started_ms = now;
+        policy.spent_today = 0;
+    };
+
+    let new_spent = policy.spent_today + amount;
+    assert!(new_spent <= policy.per_day_cap, ECapExceededPerDay);
+    policy.spent_today = new_spent;
+
+    audit::emit_allowed(
+        policy.agent_id,
+        policy.version,
+        amount,
+        target_package,
+        now,
+    );
 }
 
-// === Accessors (read-only) ===
+// === Accessors ===
 
 public fun version(policy: &Policy): u64 { policy.version }
 public fun is_revoked(policy: &Policy): bool { policy.revoked }
+public fun is_paused(policy: &Policy): bool { policy.paused }
 public fun agent_id(policy: &Policy): vector<u8> { policy.agent_id }
+public fun per_tx_cap(policy: &Policy): u64 { policy.per_tx_cap }
+public fun per_day_cap(policy: &Policy): u64 { policy.per_day_cap }
+public fun spent_today(policy: &Policy): u64 { policy.spent_today }

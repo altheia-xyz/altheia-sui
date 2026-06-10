@@ -1,0 +1,214 @@
+/// altheia::vault
+///
+/// Operator-owned vault holding agent-spendable funds as `Balance<T>`
+/// (store-only inside the vault — the Balance itself can never escape
+/// as a top-level object). The ONLY exit path is `withdraw_with_receipt`,
+/// which gates by AgentCap + Policy and mints a hot-potato
+/// `WithdrawalReceipt` that MUST be consumed before the PTB completes.
+///
+/// This is the front-door module: provision, deposit, mint policy +
+/// agent caps, admin operations, withdraw. Operator interactions go
+/// here. Closes the `Coin<T>.store` escape we identified in the 4-lens
+/// review — the agent never holds a Coin without also holding an
+/// unconsumed receipt.
+module altheia::vault;
+
+use sui::balance::{Self, Balance};
+use sui::coin::{Self, Coin};
+use sui::clock::Clock;
+use altheia::policy::{Self, Policy};
+use altheia::agent::{Self, AgentCap};
+use altheia::receipt::{Self, WithdrawalReceipt};
+
+/// Shared vault per (operator, asset T). Balance<T> has no `key` and no
+/// `drop` — it can only live inside this struct.
+public struct Vault<phantom T> has key {
+    id: UID,
+    balance: Balance<T>,
+    operator: address,
+}
+
+/// Operator's master capability. `key + store` so the operator can move
+/// it between their own wallets, hold it in a multisig, etc.
+public struct OwnerCap has key, store {
+    id: UID,
+    vault_id: ID,
+}
+
+// === Errors ===
+const EWrongVault: u64 = 1;
+const EInsufficientBalance: u64 = 2;
+// Note: EWrongPolicyForVault is asserted inside policy::check_and_consume
+// (which checks cap.policy_id == id(policy)); no separate vault-side check.
+
+// === Provisioning ===
+
+/// Create an empty Vault<T> + return OwnerCap. Vault is shared.
+public fun provision<T>(ctx: &mut TxContext): OwnerCap {
+    let vault = Vault<T> {
+        id: object::new(ctx),
+        balance: balance::zero<T>(),
+        operator: ctx.sender(),
+    };
+    let vault_id = object::id(&vault);
+    transfer::share_object(vault);
+    OwnerCap {
+        id: object::new(ctx),
+        vault_id,
+    }
+}
+
+/// Deposit a Coin into the vault. Anyone can deposit (adding funds is
+/// harmless; only the operator-gated path can withdraw).
+public fun deposit<T>(vault: &mut Vault<T>, coin: Coin<T>) {
+    balance::join(&mut vault.balance, coin.into_balance());
+}
+
+/// Operator mints a new policy for an agent. Policy is shared.
+/// Returns the policy ID so the operator can hand it to the agent
+/// alongside the AgentCap.
+public fun mint_policy<T>(
+    vault: &Vault<T>,
+    owner: &OwnerCap,
+    agent_id: vector<u8>,
+    per_tx_cap: u64,
+    per_day_cap: u64,
+    allowed_packages: vector<address>,
+    expires_at_ms: u64,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): ID {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    policy::mint_and_share(
+        agent_id,
+        per_tx_cap,
+        per_day_cap,
+        allowed_packages,
+        expires_at_ms,
+        clock,
+        ctx,
+    )
+}
+
+/// Operator mints an AgentCap for `agent_addr`. The cap is `key`-only,
+/// so the agent cannot transfer it away.
+public fun mint_agent_cap<T>(
+    vault: &Vault<T>,
+    owner: &OwnerCap,
+    policy_id: ID,
+    agent_id: vector<u8>,
+    agent_addr: address,
+    ctx: &mut TxContext,
+) {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    agent::mint_and_transfer(
+        agent_id,
+        object::id(vault),
+        policy_id,
+        agent_addr,
+        ctx,
+    );
+}
+
+// === Admin (owner-gated policy mutations) ===
+
+public fun admin_update_policy_caps<T>(
+    vault: &Vault<T>,
+    owner: &OwnerCap,
+    policy: &mut Policy,
+    new_per_tx_cap: u64,
+    new_per_day_cap: u64,
+    clock: &Clock,
+) {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    policy::set_caps(policy, new_per_tx_cap, new_per_day_cap, clock);
+}
+
+public fun admin_revoke_policy<T>(
+    vault: &Vault<T>,
+    owner: &OwnerCap,
+    policy: &mut Policy,
+    clock: &Clock,
+) {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    policy::set_revoked(policy, clock);
+}
+
+public fun admin_pause_policy<T>(
+    vault: &Vault<T>,
+    owner: &OwnerCap,
+    policy: &mut Policy,
+    clock: &Clock,
+) {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    policy::set_paused(policy, true, clock);
+}
+
+public fun admin_unpause_policy<T>(
+    vault: &Vault<T>,
+    owner: &OwnerCap,
+    policy: &mut Policy,
+    clock: &Clock,
+) {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    policy::set_paused(policy, false, clock);
+}
+
+// === Withdraw (the gate) ===
+
+/// Withdraw `amount` of T from the vault for the agent's use. Returns
+/// (Coin<T>, WithdrawalReceipt). The receipt is a hot potato that MUST
+/// be consumed via `altheia::receipt::attest_*` before the PTB ends,
+/// else the entire PTB aborts and the Coin never materializes.
+///
+/// Authorization chain:
+///   1. cap.vault_id == object::id(vault)   else EWrongVault
+///   2. policy::check_and_consume (also checks cap.policy_id, caps,
+///      scope, revoked, paused, expiry; updates spent_today)
+///   3. vault.balance >= amount             else EInsufficientBalance
+public fun withdraw_with_receipt<T>(
+    vault: &mut Vault<T>,
+    cap: &AgentCap,
+    policy: &mut Policy,
+    amount: u64,
+    target_package: address,
+    recipient: address,
+    asset_tag: vector<u8>,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): (Coin<T>, WithdrawalReceipt) {
+    assert!(agent::vault_id(cap) == object::id(vault), EWrongVault);
+    // check_and_consume verifies cap.policy_id == id(policy) internally.
+    policy::check_and_consume(policy, cap, amount, target_package, clock);
+    assert!(balance::value(&vault.balance) >= amount, EInsufficientBalance);
+
+    let b = balance::split(&mut vault.balance, amount);
+    let c = coin::from_balance(b, ctx);
+    let r = receipt::new(
+        agent::agent_id(cap),
+        amount,
+        asset_tag,
+        recipient,
+        policy::version(policy),
+        clock.timestamp_ms(),
+    );
+    (c, r)
+}
+
+// === Accessors ===
+
+public fun balance<T>(vault: &Vault<T>): u64 {
+    balance::value(&vault.balance)
+}
+
+public fun operator<T>(vault: &Vault<T>): address {
+    vault.operator
+}
+
+public fun vault_id<T>(vault: &Vault<T>): ID {
+    object::id(vault)
+}
+
+public fun owner_vault_id(cap: &OwnerCap): ID {
+    cap.vault_id
+}
