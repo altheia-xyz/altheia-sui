@@ -1,63 +1,70 @@
 # altheia-sui
 
-Move implementation of the `(sui, move-policy-object)` substrate under altheia's chain-agnostic + substrate-agnostic policy plane.
+**The on-chain agent-policy substrate Sui doesn't have.**
 
-This repo implements the 4-method substrate-adapter contract v1.0. The same policy DSL above the substrate compiles to Swig session keys on Solana (see [altheia-program](https://github.com/altheia-xyz/altheia-program)) and to the Move policy objects defined here for Sui.
+On Solana, an operator can bound an AI agent with Swig: an on-chain session-key smart account that caps what the agent can sign. On Sui there is no equivalent. Privy ships Sui *wallets* but its policy engine is EVM/SVM-only — it does not reach MoveVM. So today there is no way, on Sui, to give an AI agent a wallet that is capped, scoped, revocable, and audited on chain.
 
-**Status:** active build, target submission Sui Overflow 2026 Agentic Web sub-track 2 — **2026-06-20**. This repo flips from private to public on submission day.
+`altheia-sui` is that primitive. Funds live in a `Balance<T>` inside a no-`store` vault; the only way out is a withdrawal that passes policy and is closed by a hot-potato receipt the transaction cannot settle without. Enforcement is **binding, not advisory** — there is no off-chain check to bypass and no fail-open path.
 
-## Modules
+Import it, and any Sui agent inherits caps + scope + revocation + audit the way Solana agents inherit Swig.
 
-| Module | Role |
-|---|---|
-| `altheia::policy` | Per-agent capability object encoding caps + scope + expiry + revocation. Implements `provision` + `revoke` from the adapter contract. |
-| `altheia::agent` | `AgentCap` the agent's signing path consumes. Routes through `policy::consume` for on-chain enforcement. |
-| `altheia::audit` | On-chain event emission. Every policy decision (allowed / denied / revoked / updated) emits an event with policy version at decision time. Required for data-lineage / incident-replay downstream. |
+**Status:** Sui Overflow 2026, Agentic Web sub-track 2 — submission **2026-06-20**. Public on submission day.
 
-## Demo
+## Why this is the substrate, not an app
 
-Demo agent is a spread trader on DeepBook v3 — lives in [altheia-sui-demo](https://github.com/altheia-xyz/altheia-sui-demo) (sibling repo). Six demo scenarios target submission day:
+```
+import altheia_sui;   // your agent is now bounded
+```
 
-1. Allowed trade under cap
-2. Per-tx cap denial
-3. Per-day cap denial
-4. Disallowed package denial
-5. Paused agent denial
-6. Revoked agent denial
+The value is in being imported. Two unrelated reference agents in [altheia-sui-demo](https://github.com/altheia-xyz/altheia-sui-demo) — a DeepBook spread-trader and a bare transfer-bot — share zero strategy code and the same enforcement primitive. Neither writes any policy logic; both route withdrawals through this package. That is the Swig pattern: the substrate enforces, the agent just trades.
 
-## Substrate-adapter contract
+## Five objects
 
-| Method (TS surface in altheia-sdk) | Move equivalent | Notes |
+| Object | Abilities | Role |
 |---|---|---|
-| `provision(policy) -> SessionToken` | `altheia::policy::mint(...) -> OwnerCap` + shared Policy object | Operator gets OwnerCap, agent reads shared Policy |
-| `enforce(action, policy) -> Allowed \| Denied` | SDK-side mirror of `consume` logic | Off-chain pre-flight, no network |
-| `revoke(token) -> Tx` | `altheia::policy::revoke(policy, owner_cap)` | Atomic, bumps version, emits `PolicyRevoked` |
-| `decodeEvent(rawEvent) -> AuditEvent` | TS adapter parses `AllowedAction` / `DeniedAction` / `PolicyRevoked` / `PolicyUpdated` events | Off-chain in altheia-sdk |
+| `Vault<T>` | `key` (shared) | Holds `Balance<T>`. Only exit is `withdraw_with_receipt`. No `store` → the balance can never escape as a standalone object. |
+| `OwnerCap` | `key, store` | Operator's master. Mints / revokes / pauses. Transferable to a multisig or cold wallet. |
+| `AgentCap` | `key` only | Per-agent capability. **No `store`** → the agent cannot transfer it away. Scopes to `(vault_id, policy_id)`. |
+| `Policy` | `key` (shared) | Caps + allowed packages + expiry + revoked/paused + cumulative `spent_today`. Shared, so daily spend persists across transactions — closes the per-PTB splitting hole. |
+| `WithdrawalReceipt` | **none** | Hot potato. Minted by every withdrawal, must be consumed by `attest_simple` / `attest_value_conservation` before the PTB settles, else the whole transaction aborts. This is the binding gate. |
 
-Full contract: [altheia-plan / 02_SRS / substrate-adapter / CONTRACT.md](https://github.com/altheia-xyz/altheia-plan/blob/main/02_SRS/substrate-adapter/CONTRACT.md).
+```
+withdraw_with_receipt(vault, agentcap, policy, amount, target, recipient, clock)
+   ├─ assert agentcap.vault_id == vault            (EWrongVault)
+   ├─ policy::check_and_consume(...)                (revoked/paused/expired/over-tx/over-day/scope)
+   ├─ assert vault.balance >= amount               (EInsufficientBalance)
+   └─ returns (Coin<T>, WithdrawalReceipt)         ← receipt MUST be attested or tx aborts
+```
+
+The combination — funds in a no-`store` vault, exit gated by a hot potato — is what makes policy binding. The agent never holds a `Coin<T>` without simultaneously holding an unconsumed receipt; the transaction cannot complete unless policy passed.
+
+## Enforcement coverage
+
+| Rule | Enforced on chain | Abort code |
+|---|---|---|
+| Per-tx cap | yes | `ECapExceededPerTx` (4) |
+| Per-day cumulative cap | yes (shared Policy, cross-PTB) | `ECapExceededPerDay` (5) |
+| Allowed-package scope | yes | `EPackageNotAllowed` (6) |
+| Revocation (kill switch) | yes | `EPolicyRevoked` (1) |
+| Pause / unpause | yes | `EPolicyPaused` (3) |
+| Expiry | yes | `EPolicyExpired` (2) |
+| Output-leg value conservation (oracled assets) | `attest_value_conservation` (DeepBook-priced) | `EUnderMinValue` |
+
+**Honest boundary:** value-conservation binds only for assets with an on-chain price reference (DeepBook). It cannot price an un-oracled token, because nothing on chain can — a freshly-minted rug token's only price is the attacker's pool. We enforce the input leg, scope, revocation, and oracled-asset value. We do not claim to stop a swap into an un-priceable asset. No one can.
 
 ## Build + test
 
 ```bash
 sui move build
-sui move test
+sui move test     # 13/13
 ```
 
 Requires `sui` CLI ≥ 1.58.
 
+## Part of the altheia policy plane
+
+One SDK (`@altheia-xyz/sdk`), one backend, one dashboard across substrates. Solana enforces via Swig; Sui enforces via this package. Same `altheia.guard(action, fn)` call, dispatched by `(chain, substrate)`.
+
 ## License
 
-Apache 2.0 (LICENSE pending — added before public-flip on Jun 20).
-
-## Roadmap
-
-| Date | Milestone |
-|---|---|
-| May 28 | All three modules compile, basic capability flow tests pass |
-| Jun 4 | Modules wired end-to-end; single script exercises `mint -> consume -> emit` |
-| Jun 10 | Demo agent live on testnet hitting real DeepBook v3 |
-| Jun 16 | Six demo scenarios reproducible from clean clone |
-| Jun 19 | Property tests green |
-| Jun 20 | Submission. Repo flips public. |
-
-See [SHIP_PLAN_2026_05_22.md](https://github.com/altheia-xyz/altheia-plan/blob/main/01_PHASES/sui/SHIP_PLAN_2026_05_22.md) for the week-by-week.
+Apache 2.0.
