@@ -44,6 +44,9 @@ const EInsufficientBalance: u64 = 2;
 // === Provisioning ===
 
 /// Create an empty Vault<T> + return OwnerCap. Vault is shared.
+/// Returns OwnerCap for PTB composition. CLI/operators use
+/// `provision_vault` (entry wrapper below) since `sui client call`
+/// cannot handle a non-droppable return value.
 public fun provision<T>(ctx: &mut TxContext): OwnerCap {
     let vault = Vault<T> {
         id: object::new(ctx),
@@ -56,6 +59,13 @@ public fun provision<T>(ctx: &mut TxContext): OwnerCap {
         id: object::new(ctx),
         vault_id,
     }
+}
+
+/// Entry wrapper: provision a vault and keep the OwnerCap. Operator-facing
+/// (plain `sui client call`), no PTB needed.
+entry fun provision_vault<T>(ctx: &mut TxContext) {
+    let owner = provision<T>(ctx);
+    transfer::public_transfer(owner, ctx.sender());
 }
 
 /// Deposit a Coin into the vault. Anyone can deposit (adding funds is

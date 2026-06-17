@@ -9,7 +9,12 @@
 /// the receipt, and nothing in the PTB can complete without closing it.
 module altheia::receipt;
 
+use sui::coin::{Self, Coin};
+use sui::clock::Clock;
+use deepbook::pool::{Self, Pool};
 use altheia::audit;
+
+const BPS_DENOM: u64 = 10_000;
 
 // === Hot potato ===
 
@@ -75,18 +80,51 @@ public fun attest_simple(
     );
 }
 
-/// Value-conservation close (for swaps): assert the swap output value
-/// is >= min_out_value at the caller-supplied price reference (the
-/// caller is responsible for sourcing a manipulation-resistant value —
-/// e.g. DeepBook TWAP — and passing it in).
-public fun attest_value_conservation(
+/// Pure: minimum acceptable output (quote base-units) for `amount_in` base
+/// base-units swapped at DeepBook `mid_price`, allowing `max_slippage_bps`.
+///
+///   expected = amount_in * mid_price / base_scalar
+///   floor    = expected * (10_000 - max_slippage_bps) / 10_000
+///
+/// mid_price convention verified on testnet 2026-06-17: raw mid_price is
+/// quote base-units per 1 WHOLE base coin (SUI/DBUSDC returned 794000 =
+/// 0.794 DBUSDC/SUI). `base_scalar` is the base coin's smallest-unit scalar
+/// (1e9 for SUI). u128 intermediates prevent overflow.
+public fun compute_min_out(
+    amount_in: u64,
+    mid_price: u64,
+    base_scalar: u64,
+    max_slippage_bps: u64,
+): u64 {
+    let expected = (amount_in as u128) * (mid_price as u128) / (base_scalar as u128);
+    let floor = expected * ((BPS_DENOM - max_slippage_bps) as u128) / (BPS_DENOM as u128);
+    floor as u64
+}
+
+/// Value-conservation close (for swaps). Reads DeepBook's mid_price ON-CHAIN
+/// and the ACTUAL received coin; reverts if the output is below the
+/// fair-rate floor. No caller-supplied bound — the agent cannot forge the
+/// price (read from `pool`) or the output (read from `coin_out`).
+///
+/// `base_scalar` + `max_slippage_bps` are policy-sourced by the caller
+/// (vault/demo reads them from the operator's Policy, not from agent input —
+/// see execute_trade_guarded). That is what makes this operator-bound, not
+/// agent-bound, and therefore non-redundant with DeepBook's own
+/// agent-supplied `min_quote_out`.
+public fun attest_value_conservation<Base, Quote>(
     receipt: WithdrawalReceipt,
-    amount_out: u64,
-    min_out_value: u64,
+    coin_out: &Coin<Quote>,
+    pool: &Pool<Base, Quote>,
+    clock: &Clock,
+    base_scalar: u64,
+    max_slippage_bps: u64,
     recipient_actual: address,
 ) {
     assert!(receipt.recipient == recipient_actual, ERecipientMismatch);
-    assert!(amount_out >= min_out_value, EUnderMinValue);
+    let price = pool::mid_price(pool, clock);
+    let min_out = compute_min_out(receipt.amount_in, price, base_scalar, max_slippage_bps);
+    let actual = coin::value(coin_out);
+    assert!(actual >= min_out, EUnderMinValue);
     let WithdrawalReceipt {
         agent_id,
         amount_in,
@@ -98,7 +136,7 @@ public fun attest_value_conservation(
     audit::emit_withdrawal_attested(
         agent_id,
         amount_in,
-        amount_out,
+        actual,
         recipient,
         policy_version,
         timestamp_ms,

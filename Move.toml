@@ -17,8 +17,17 @@ authors = ["altheia-xyz <hi@altheia.xyz>"]
 #   audit::Anchor      on-chain audit event emission
 #
 # Target: Sui Overflow 2026 Agentic Web sub-track 2 submission 2026-06-20.
+#
+# published-at is set dynamically per network at publish time by
+# altheia-sui-demo/scripts/e2e-localnet.sh. Left as 0x0 in git so the
+# package always republishes cleanly.
 
 [dependencies]
+# Real DeepBook v3 — price oracle for value-conservation (probe-proven to
+# link 2026-06-17). Dep key MUST be `deepbook` (matches package name); do NOT
+# set deepbook in [addresses] (DeepBook pins it 0x0 → conflict). Testnet pkg
+# id is supplied at publish via --build-env / address resolution.
+deepbook = { git = "https://github.com/MystenLabs/deepbookv3.git", subdir = "packages/deepbook", rev = "main" }
 
 [addresses]
 altheia = "0x0"
