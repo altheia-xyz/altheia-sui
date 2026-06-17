@@ -101,16 +101,15 @@ public fun compute_min_out(
     floor as u64
 }
 
-/// Value-conservation close (for swaps). Reads DeepBook's mid_price ON-CHAIN
-/// and the ACTUAL received coin; reverts if the output is below the
-/// fair-rate floor. No caller-supplied bound — the agent cannot forge the
-/// price (read from `pool`) or the output (read from `coin_out`).
+/// Consume the receipt, asserting the swap output meets the fair-rate floor.
 ///
-/// `base_scalar` + `max_slippage_bps` are policy-sourced by the caller
-/// (vault/demo reads them from the operator's Policy, not from agent input —
-/// see execute_trade_guarded). That is what makes this operator-bound, not
-/// agent-bound, and therefore non-redundant with DeepBook's own
-/// agent-supplied `min_quote_out`.
+/// Reads `mid_price` from `pool` and `coin::value(coin_out)`; computes the
+/// floor via `compute_min_out(amount_in, mid_price, base_scalar,
+/// max_slippage_bps)`; aborts `EUnderMinValue` if the output is below it.
+/// Neither the price nor the output is caller-supplied. Callers source
+/// `base_scalar` + `max_slippage_bps` from the operator's Policy.
+///
+/// Aborts: ERecipientMismatch, EUnderMinValue.
 public fun attest_value_conservation<Base, Quote>(
     receipt: WithdrawalReceipt,
     coin_out: &Coin<Quote>,

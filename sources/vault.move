@@ -164,6 +164,20 @@ public fun admin_unpause_policy<T>(
     policy::set_paused(policy, false, clock);
 }
 
+/// Operator configures the value-guard bound for swaps. Agent-callable
+/// paths read these from the Policy; the agent cannot set them.
+public fun admin_set_value_guard<T>(
+    vault: &Vault<T>,
+    owner: &OwnerCap,
+    policy: &mut Policy,
+    max_slippage_bps: u64,
+    base_scalar: u64,
+    clock: &Clock,
+) {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    policy::set_value_guard(policy, max_slippage_bps, base_scalar, clock);
+}
+
 // === Withdraw (the gate) ===
 
 /// Withdraw `amount` of T from the vault for the agent's use. Returns

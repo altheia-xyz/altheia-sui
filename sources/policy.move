@@ -26,6 +26,13 @@ public struct Policy has key {
     revoked: bool,
     paused: bool,
     version: u64,
+    // Value-guard params (operator-set; agent cannot supply them). Read by
+    // the demo's execute_trade_guarded and passed to
+    // receipt::attest_value_conservation. Default 0 until configured via
+    // vault::admin_set_value_guard; base_scalar must be > 0 before the
+    // guarded path is used.
+    max_slippage_bps: u64,
+    base_scalar: u64,
 }
 
 // === Errors ===
@@ -64,6 +71,8 @@ public(package) fun new(
         revoked: false,
         paused: false,
         version: 1,
+        max_slippage_bps: 0,
+        base_scalar: 0,
     }
 }
 
@@ -127,6 +136,27 @@ public(package) fun set_paused(policy: &mut Policy, paused: bool, clock: &Clock)
     );
 }
 
+/// Operator-set value-guard params. `base_scalar` is the base coin's
+/// smallest-unit scalar (1e9 for SUI); `max_slippage_bps` the allowed
+/// deviation below DeepBook's fair rate. Set by vault::admin_set_value_guard.
+public(package) fun set_value_guard(
+    policy: &mut Policy,
+    max_slippage_bps: u64,
+    base_scalar: u64,
+    clock: &Clock,
+) {
+    let before = policy.version;
+    policy.max_slippage_bps = max_slippage_bps;
+    policy.base_scalar = base_scalar;
+    policy.version = before + 1;
+    audit::emit_updated(
+        policy.agent_id,
+        before,
+        policy.version,
+        clock::timestamp_ms(clock),
+    );
+}
+
 // === Enforcement gate ===
 
 /// Aborts on any rule failure; updates spent_today + day window on
@@ -180,3 +210,5 @@ public fun agent_id(policy: &Policy): vector<u8> { policy.agent_id }
 public fun per_tx_cap(policy: &Policy): u64 { policy.per_tx_cap }
 public fun per_day_cap(policy: &Policy): u64 { policy.per_day_cap }
 public fun spent_today(policy: &Policy): u64 { policy.spent_today }
+public fun max_slippage_bps(policy: &Policy): u64 { policy.max_slippage_bps }
+public fun base_scalar(policy: &Policy): u64 { policy.base_scalar }
