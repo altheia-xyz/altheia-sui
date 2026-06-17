@@ -4,8 +4,8 @@
 /// receipt attestation emits an event consumed by altheia's off-chain
 /// audit indexer.
 ///
-/// Each event carries the policy version at decision time required for
-/// incident replay + data lineage (regulator ask).
+/// Each event carries the policy version at decision time, for incident
+/// replay and data-lineage reconstruction.
 module altheia::audit;
 
 use sui::event;

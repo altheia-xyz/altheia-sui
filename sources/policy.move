@@ -1,9 +1,9 @@
 /// altheia::policy
 ///
 /// Per-agent policy as a SHARED object. Holds caps + scope + cumulative
-/// spend state. Because Policy is shared, the daily window state
-/// persists across PTBs — closes the per-PTB splitting hole the 4-lens
-/// review identified.
+/// spend state. Because Policy is shared, cumulative daily spend persists
+/// across transactions, so caps cannot be bypassed by splitting a spend
+/// across multiple PTBs.
 ///
 /// `check_and_consume` is the enforcement gate, called by
 /// vault::withdraw_with_receipt before any Coin leaves the vault.

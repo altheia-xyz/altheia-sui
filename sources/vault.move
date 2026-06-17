@@ -6,11 +6,11 @@
 /// which gates by AgentCap + Policy and mints a hot-potato
 /// `WithdrawalReceipt` that MUST be consumed before the PTB completes.
 ///
-/// This is the front-door module: provision, deposit, mint policy +
-/// agent caps, admin operations, withdraw. Operator interactions go
-/// here. Closes the `Coin<T>.store` escape we identified in the 4-lens
-/// review — the agent never holds a Coin without also holding an
-/// unconsumed receipt.
+/// Front-door module: provision, deposit, mint policy + agent caps, admin
+/// operations, withdraw. Funds are held as `Balance<T>` (not transferable
+/// `Coin<T>`) and can only leave through `withdraw_with_receipt`, so the
+/// agent never holds spendable funds without an accompanying unconsumed
+/// receipt.
 module altheia::vault;
 
 use sui::balance::{Self, Balance};
