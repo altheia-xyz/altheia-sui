@@ -217,7 +217,9 @@ public(package) fun check_and_consume(
     let now = clock::timestamp_ms(clock);
     assert!(now < policy.expires_at_ms, EPolicyExpired);
 
-    assert!(amount <= policy.per_tx_cap, ECapExceededPerTx);
+    // per_tx_cap is OPTIONAL: 0 = no per-tx limit (rely on the per-day budget).
+    // The required cap is per_day_cap (the budget); per-tx is a refinement.
+    if (policy.per_tx_cap > 0) assert!(amount <= policy.per_tx_cap, ECapExceededPerTx);
     assert!(policy.allowed_packages.contains(&target_package), EPackageNotAllowed);
 
     // Roll the daily window if it's been ≥ 24h since it started.

@@ -1,4 +1,5 @@
 [package]
+published-at = "0xf6026a4f13724b9b6156951da0ac7322cf95feec61d4470107e728608dd55ab2"
 name = "altheia_deepbook"
 edition = "2024.beta"
 version = "0.1.0"
@@ -17,4 +18,4 @@ altheia_sui = { local = "../.." }
 deepbook = { git = "https://github.com/MystenLabs/deepbookv3.git", subdir = "packages/deepbook", rev = "testnet-v17.0.0" }
 
 [addresses]
-altheia_deepbook = "0x0"
+altheia_deepbook = "0xf6026a4f13724b9b6156951da0ac7322cf95feec61d4470107e728608dd55ab2"

@@ -12,10 +12,13 @@ module altheia_deepbook::deepbook_adapter;
 
 use sui::coin::{Self, Coin};
 use sui::clock::Clock;
-use deepbook::pool::{Self, Pool};
+use deepbook::pool::{Self as dbpool, Pool};
+use token::deep::DEEP;
 use altheia::receipt::{Self, WithdrawalReceipt};
 use altheia::registry::AdapterRegistry;
 use altheia::policy::{Self, Policy};
+use altheia::vault::{Self, Vault};
+use altheia::agent::AgentCap;
 use altheia::actions;
 
 /// Registry key for this adapter. Only this module can construct it, so a
@@ -25,12 +28,18 @@ public struct DeepBookWitness has drop {}
 
 const BPS_DENOM: u64 = 10_000;
 
-/// Operator hasn't configured the value guard (base_scalar still 0).
-const EValueGuardNotConfigured: u64 = 1;
-
-/// DeepBook price scaling: quote_qty = base_qty * mid_price / FLOAT_SCALING
-/// (decimal adjustment is baked into mid_price). Holds for both directions.
+/// DeepBook price scaling: quote_qty = base_qty * mid_price / FLOAT_SCALING.
 const FLOAT_SCALING: u128 = 1_000_000_000;
+
+/// Scale for the operator-set value-guard rate: min_out = spent * rate / RATE_SCALE.
+/// rate = minimum output base-units per 1 input quote-unit, times RATE_SCALE.
+const RATE_SCALE: u128 = 1_000_000_000;
+
+/// Pure: minimum acceptable output for `spent` input units at the operator's
+/// `min_rate` (no oracle — the floor is operator-declared, not market-read).
+public fun min_out_from_rate(spent: u64, min_rate: u64): u64 {
+    ((spent as u128) * (min_rate as u128) / RATE_SCALE) as u64
+}
 
 /// Pure: minimum acceptable output (quote base-units) for `amount_in` base
 /// base-units swapped at DeepBook `mid_price`, allowing `max_slippage_bps`.
@@ -61,59 +70,49 @@ public fun compute_min_base_out(
     floor as u64
 }
 
-/// Close the receipt for a base->quote swap. Enforces the `DEEPBOOK_SWAP`
-/// capability and reads the value-guard (slippage + scalar) from the on-chain
-/// Policy — the agent composes the PTB, so the floor cannot be a caller arg.
-/// Reads `mid_price` from `pool`; core reads `coin::value(coin_out)` + registry.
-/// `base_left` is the unfilled base, so the floor is on actual spent.
+/// Guarded quote->base swap, atomic in one call (spend Quote e.g. SUI, receive
+/// Base e.g. DEEP on the whitelisted DEEP/SUI pool). The agent calls this one
+/// function — the developer deploys nothing.
 ///
-/// Aborts: ENotAllowedAction / EValueGuardNotConfigured / ENotApprovedAdapter /
-/// ERecipientMismatch / EUnderMinValue.
-public fun attest_value_conservation<Base, Quote>(
-    r: WithdrawalReceipt,
+/// The reference `mid_price` is read BEFORE the swap, because the swap itself
+/// moves/empties the book (reading it after can abort or misprice). The
+/// value-guard (slippage) is read from the on-chain Policy; the floor is
+/// computed on what was actually spent (`amount - quote_left`) so legit partial
+/// fills pass. Core measures the received Base coin + checks the registry gate.
+///
+/// Aborts: ENotAllowedAction / EValueGuardNotConfigured / (policy caps/scope/
+/// revoked/paused/expiry) / ENotApprovedAdapter / EUnderMinValue.
+public fun execute_swap_quote_for_base<Base, Quote>(
+    vault: &mut Vault<Quote>,
+    cap: &AgentCap,
+    policy: &mut Policy,
+    pool: &mut Pool<Base, Quote>,
     registry: &AdapterRegistry,
-    policy: &Policy,
-    coin_out: &Coin<Quote>,
-    base_left: &Coin<Base>,
-    pool: &Pool<Base, Quote>,
+    amount: u64,
+    recipient: address,
     clock: &Clock,
-    recipient_actual: address,
+    ctx: &mut TxContext,
 ) {
     policy::assert_allows(policy, actions::deepbook_swap());
-    let scalar = policy::base_scalar(policy);
-    assert!(scalar > 0, EValueGuardNotConfigured);
-    let slippage = policy::max_slippage_bps(policy);
-    let price = pool::mid_price(pool, clock);
-    let spent = receipt::amount_in(&r) - coin::value(base_left);
-    let min_out = compute_min_out(spent, price, scalar, slippage);
-    receipt::consume_with_check<DeepBookWitness, Quote>(
-        DeepBookWitness {}, registry, r, coin_out, min_out, recipient_actual,
-    );
-}
+    // Operator-set floor rate (base-units out per quote-unit in). No oracle, no
+    // book dependency. action_params aborts EActionConfigMissing if unset.
+    let min_rate = policy::action_params(policy, actions::deepbook_swap())[0];
 
-/// Close the receipt for a quote->base swap (spend SUI, receive DEEP on the
-/// whitelisted DEEP/SUI pool). Same policy-read guard; `quote_left` is the
-/// unspent quote so the floor is on actual spent (legit partial fills pass).
-///
-/// Aborts: ENotAllowedAction / EValueGuardNotConfigured / ENotApprovedAdapter /
-/// ERecipientMismatch / EUnderMinValue.
-public fun attest_value_conservation_quote_for_base<Base, Quote>(
-    r: WithdrawalReceipt,
-    registry: &AdapterRegistry,
-    policy: &Policy,
-    base_out: &Coin<Base>,
-    quote_left: &Coin<Quote>,
-    pool: &Pool<Base, Quote>,
-    clock: &Clock,
-    recipient_actual: address,
-) {
-    policy::assert_allows(policy, actions::deepbook_swap());
-    assert!(policy::base_scalar(policy) > 0, EValueGuardNotConfigured);
-    let slippage = policy::max_slippage_bps(policy);
-    let price = pool::mid_price(pool, clock);
-    let spent = receipt::amount_in(&r) - coin::value(quote_left);
-    let min_out = compute_min_base_out(spent, price, slippage);
-    receipt::consume_with_check<DeepBookWitness, Base>(
-        DeepBookWitness {}, registry, r, base_out, min_out, recipient_actual,
+    let target_pool = object::id(pool).to_address();
+    // withdraw runs check_and_consume first → revoke/pause/expiry/caps/scope.
+    let (coin_in, r) = vault::withdraw_with_receipt(
+        vault, cap, policy, amount, target_pool, recipient, b"SWAP", clock, ctx,
     );
+    let deep_in = coin::zero<DEEP>(ctx);
+    let (base_out, quote_left, deep_left) = dbpool::swap_exact_quote_for_base<Base, Quote>(
+        pool, coin_in, deep_in, 0, clock, ctx,
+    );
+    let spent = amount - coin::value(&quote_left);
+    let min_out = min_out_from_rate(spent, min_rate);
+    receipt::consume_with_check<DeepBookWitness, Base>(
+        DeepBookWitness {}, registry, r, &base_out, min_out, recipient,
+    );
+    transfer::public_transfer(base_out, recipient);
+    transfer::public_transfer(quote_left, recipient);
+    transfer::public_transfer(deep_left, recipient);
 }

@@ -124,6 +124,23 @@ fun test_check_and_consume_aborts_over_per_day_cap() {
     ts::end(scenario);
 }
 
+// per_tx_cap = 0 means no per-tx limit; only the per-day budget binds.
+#[test]
+fun test_per_tx_cap_zero_is_optional() {
+    let (mut scenario, owner, clk) = setup_with_caps(0, 500);
+    ts::next_tx(&mut scenario, AGENT);
+    let cap = ts::take_from_sender<AgentCap>(&scenario);
+    let mut p = ts::take_shared<Policy>(&scenario);
+    // 400 in one tx: would exceed a typical per-tx cap, but per_tx=0 disables it.
+    policy::check_and_consume(&mut p, &cap, 400, ALLOWED_PKG, &clk);
+    assert!(policy::spent_today(&p) == 400, 0);
+    test_utils::destroy(cap);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    test_utils::destroy(owner);
+    ts::end(scenario);
+}
+
 // Capability allowlist: default-deny — only listed actions are permitted.
 #[test]
 fun test_allowlist_allows_and_denies() {
