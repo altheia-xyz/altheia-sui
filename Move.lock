@@ -19,11 +19,11 @@ deps = { MoveStdlib = "MoveStdlib" }
 [pinned.testnet.altheia_sui]
 source = { root = true }
 use_environment = "testnet"
-manifest_digest = "EF55A39C03806D44F7224057AF3F6B7DC7E067950C63BB52702F3BF5557FC743"
+manifest_digest = "7754D0F3D15D9205EE81A92C498677116D6EE33BEBBADE74021099F37DC03554"
 deps = { deepbook = "deepbook", std = "MoveStdlib", sui = "Sui" }
 
 [pinned.testnet.deepbook]
-source = { git = "https://github.com/MystenLabs/deepbookv3.git", subdir = "packages/deepbook", rev = "c44689d2a7732638f1c994e6ab2c473bd8138904" }
+source = { git = "https://github.com/MystenLabs/deepbookv3.git", subdir = "packages/deepbook", rev = "5e4d23801011004a88c39018e105ca02b705f449" }
 use_environment = "testnet"
 manifest_digest = "3101923B9428545A4F52FFAD1C4F959F9BFFF84CD09CE4BCC1CB831286999B5A"
 deps = { std = "MoveStdlib", sui = "Sui", token = "token" }

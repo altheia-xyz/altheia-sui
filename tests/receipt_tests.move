@@ -87,29 +87,26 @@ fun test_attest_simple_aborts_on_recipient_mismatch() {
     ts::end(scenario);
 }
 
-// Value-conservation MATH (the bug-prone part) is unit-tested as a pure
-// function — no DeepBook Pool to construct. The Pool-reading wrapper
-// (attest_value_conservation) is integration-tested on testnet against the
-// real SUI/DBUSDC pool. Numbers below are testnet-verified (mid_price=794000,
-// SUI base_scalar=1e9 → SUI ≈ 0.794 DBUSDC).
+// consume_with_check is the generic, protocol-agnostic value gate. Adapters
+// (deepbook_adapter etc.) compute actual/min and call it. The DeepBook
+// scaling math + its tests now live in the adapter (altheia-sui-demo).
 
 #[test]
-fun compute_min_out_matches_deepbook_scaling() {
-    // 1 SUI (1e9 base) @ 0 slippage -> 794000 DBUSDC base (= 0.794 USDC)
-    assert!(receipt::compute_min_out(1_000_000_000, 794_000, 1_000_000_000, 0) == 794_000, 0);
-    // 1% slippage -> 794000 * 0.99 = 786060
-    assert!(receipt::compute_min_out(1_000_000_000, 794_000, 1_000_000_000, 100) == 786_060, 1);
-    // half a SUI -> half the floor
-    assert!(receipt::compute_min_out(500_000_000, 794_000, 1_000_000_000, 0) == 397_000, 2);
+fun consume_with_check_passes_when_actual_meets_min() {
+    let r = receipt::new_for_testing(b"a", 100, b"SUI", RECIPIENT, 1, 0);
+    receipt::consume_with_check(r, 100, 99, RECIPIENT);
 }
 
 #[test]
-fun compute_min_out_zero_amount_is_zero() {
-    assert!(receipt::compute_min_out(0, 794_000, 1_000_000_000, 100) == 0, 0);
+#[expected_failure(abort_code = ::altheia::receipt::EUnderMinValue)]
+fun consume_with_check_reverts_when_actual_below_min() {
+    let r = receipt::new_for_testing(b"a", 100, b"SUI", RECIPIENT, 1, 0);
+    receipt::consume_with_check(r, 50, 99, RECIPIENT);
 }
 
 #[test]
-fun compute_min_out_no_overflow_large() {
-    // 1e12 * 794000 = 7.94e17 (fits u128); /1e9 = 794_000_000; *0.995 = 790_030_000
-    assert!(receipt::compute_min_out(1_000_000_000_000, 794_000, 1_000_000_000, 50) == 790_030_000, 0);
+#[expected_failure(abort_code = ::altheia::receipt::ERecipientMismatch)]
+fun consume_with_check_reverts_on_recipient_mismatch() {
+    let r = receipt::new_for_testing(b"a", 100, b"SUI", RECIPIENT, 1, 0);
+    receipt::consume_with_check(r, 100, 99, WRONG_RECIPIENT);
 }

@@ -23,11 +23,9 @@ authors = ["altheia-xyz <hi@altheia.xyz>"]
 # package always republishes cleanly.
 
 [dependencies]
-# Real DeepBook v3 — price oracle for value-conservation (probe-proven to
-# link 2026-06-17). Dep key MUST be `deepbook` (matches package name); do NOT
-# set deepbook in [addresses] (DeepBook pins it 0x0 → conflict). Testnet pkg
-# id is supplied at publish via --build-env / address resolution.
-deepbook = { git = "https://github.com/MystenLabs/deepbookv3.git", subdir = "packages/deepbook", rev = "main" }
+# Core is protocol-agnostic — NO DeepBook dependency. Venue integrations
+# (DeepBook, perps, lending) are separate adapter modules that call
+# receipt::consume_with_check.
 
 [addresses]
 altheia = "0x0"
