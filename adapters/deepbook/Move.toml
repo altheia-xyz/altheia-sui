@@ -1,0 +1,20 @@
+[package]
+name = "altheia_deepbook"
+edition = "2024.beta"
+version = "0.1.0"
+license = "Apache-2.0"
+authors = ["altheia-xyz <hi@altheia.xyz>"]
+
+# First entry in the altheia adapter catalog. Venue glue for DeepBook v3:
+# reads pool mid_price, computes the fair-rate floor, and closes the core
+# hot-potato receipt with the DeepBookWitness. Registry-gated in core, so
+# this adapter can only settle a withdrawal once its witness is approved.
+# Sibling adapters (transfer, perps, lending) are separate packages with the
+# same shape; the protocol-agnostic core never depends on any venue.
+
+[dependencies]
+altheia_sui = { local = "../.." }
+deepbook = { git = "https://github.com/MystenLabs/deepbookv3.git", subdir = "packages/deepbook", rev = "testnet-v17.0.0" }
+
+[addresses]
+altheia_deepbook = "0x0"
