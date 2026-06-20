@@ -181,6 +181,20 @@ public(package) fun set_value_guard(
     );
 }
 
+// === Liveness gate (for actions that don't move Vault funds) ===
+
+/// Assert the agent's policy is live: correct policy, not revoked/paused/expired.
+/// Order-book actions (limit order, cancel) settle against a BalanceManager,
+/// not the Vault, so they bypass `check_and_consume`; they call this instead so
+/// revoke/pause/expiry still stop them. (Amount caps don't apply — no Vault
+/// withdrawal — but kill-switches must.)
+public fun assert_active(policy: &Policy, cap: &AgentCap, clock: &Clock) {
+    assert!(agent::policy_id(cap) == object::id(policy), EWrongPolicy);
+    assert!(!policy.revoked, EPolicyRevoked);
+    assert!(!policy.paused, EPolicyPaused);
+    assert!(clock::timestamp_ms(clock) < policy.expires_at_ms, EPolicyExpired);
+}
+
 // === Enforcement gate ===
 
 /// Aborts on any rule failure; updates spent_today + day window on
