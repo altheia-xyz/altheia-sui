@@ -28,7 +28,7 @@ authors = ["altheia-xyz <hi@altheia.xyz>"]
 # receipt::consume_with_check.
 
 [addresses]
-altheia = "0x49bebb9672a8a4ca8c26f5784f0357164148358b712661fb33e388ee41c8c74e"
+altheia = "0x0"
 
 [dev-dependencies]
 
