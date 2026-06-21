@@ -2,7 +2,7 @@
 name = "altheia_deepbook"
 edition = "2024.beta"
 version = "0.1.0"
-license = "Apache-2.0"
+license = "Proprietary"
 authors = ["altheia-xyz <hi@altheia.xyz>"]
 
 # First entry in the altheia adapter catalog. Venue glue for DeepBook v3:
