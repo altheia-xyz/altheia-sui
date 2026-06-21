@@ -19,6 +19,7 @@ use sui::clock::Clock;
 use altheia::policy::{Self, Policy};
 use altheia::agent::{Self, AgentCap};
 use altheia::receipt::{Self, WithdrawalReceipt};
+use altheia::actions;
 
 /// Shared vault per (operator, asset T). Balance<T> has no `key` and no
 /// `drop` — it can only live inside this struct.
@@ -149,8 +150,11 @@ public fun share_vault<T>(vault: Vault<T>) {
     transfer::share_object(vault);
 }
 
-/// Mint a policy returning it BY VALUE (unshared), value-guard folded in so no
-/// separate set-params tx is needed. Caller shares it via `policy::share`.
+/// DEPRECATED (shipped in the first upgrade): sets the unused
+/// max_slippage/base_scalar value-guard and does NOT set the swap action_params
+/// the adapter requires, so swaps from such a policy abort EActionConfigMissing.
+/// Retained verbatim only for Sui upgrade-compatibility — use
+/// `mint_policy_with_guard`. Removed at the next full republish.
 public fun mint_policy_open<T>(
     vault: &Vault<T>,
     owner: &OwnerCap,
@@ -171,6 +175,33 @@ public fun mint_policy_open<T>(
     );
     if (max_slippage_bps > 0 || base_scalar > 0) {
         policy::set_value_guard(&mut p, max_slippage_bps, base_scalar, clock);
+    };
+    p
+}
+
+/// Mint a policy BY VALUE (unshared) with the swap value-guard folded in as
+/// action_params[deepbook_swap] (the adapter aborts EActionConfigMissing if
+/// unset). This is the correct single-PTB provisioning entry. Caller shares it
+/// via `policy::share`.
+public fun mint_policy_with_guard<T>(
+    vault: &Vault<T>,
+    owner: &OwnerCap,
+    agent_id: vector<u8>,
+    per_tx_cap: u64,
+    per_day_cap: u64,
+    allowed_packages: vector<address>,
+    allowed_actions: vector<u8>,
+    expires_at_ms: u64,
+    swap_min_rate: u64,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): Policy {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    let mut p = policy::new(
+        agent_id, per_tx_cap, per_day_cap, allowed_packages, allowed_actions, expires_at_ms, clock, ctx,
+    );
+    if (swap_min_rate > 0) {
+        policy::set_action_params(&mut p, actions::deepbook_swap(), vector[swap_min_rate], clock);
     };
     p
 }

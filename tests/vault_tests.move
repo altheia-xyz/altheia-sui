@@ -7,7 +7,8 @@ use sui::test_utils;
 use sui::clock;
 use sui::coin;
 use altheia::vault::{Self, Vault};
-use altheia::policy::Policy;
+use altheia::policy::{Self, Policy};
+use altheia::actions;
 use altheia::agent::AgentCap;
 use altheia::receipt;
 use altheia::registry::{Self, AdapterRegistry};
@@ -16,6 +17,38 @@ use altheia::test_support::{Self, AdapterW};
 const OPERATOR: address = @0xCAFE;
 const AGENT: address = @0xBEEF;
 const RECIPIENT: address = @0xFACE;
+
+// Single-PTB provisioning: provision_open + deposit + mint_policy_open +
+// mint_agent_cap_for compose without intermediate sharing, and the swap
+// value-guard (action_params[deepbook_swap]) is set so the adapter won't abort
+// EActionConfigMissing. This is the contract side of the one-signature mint.
+#[test]
+fun test_single_ptb_provision_sets_swap_action_params() {
+    let mut scenario = ts::begin(OPERATOR);
+    let clk = clock::create_for_testing(ts::ctx(&mut scenario));
+
+    // returns vault + owner BY VALUE (unshared) for one-PTB composition
+    let (mut v, owner) = vault::provision_open<SUI>(ts::ctx(&mut scenario));
+    let funds = coin::mint_for_testing<SUI>(2_000, ts::ctx(&mut scenario));
+    vault::deposit(&mut v, funds);
+    assert!(vault::balance(&v) == 2_000, 0);
+
+    let p = vault::mint_policy_with_guard<SUI>(
+        &v, &owner, b"agent-ptb", 500, 2_000, vector[@0x123], vector[1], 9_999_999_999_999, 15_000_000, &clk, ts::ctx(&mut scenario),
+    );
+    // the bug this guards against: a single-PTB policy with no swap action-param
+    assert!(policy::has_action_params(&p, actions::deepbook_swap()), 1);
+    assert!(policy::action_params(&p, actions::deepbook_swap())[0] == 15_000_000, 2);
+
+    vault::mint_agent_cap_for<SUI>(&v, &owner, &p, b"agent-ptb", AGENT, ts::ctx(&mut scenario));
+
+    // PTB-end: consume the by-value objects (share / hand to owner)
+    policy::share(p);
+    vault::share_vault(v);
+    test_utils::destroy(owner);
+    clock::destroy_for_testing(clk);
+    ts::end(scenario);
+}
 
 #[test]
 fun test_provision_creates_vault_and_returns_owner() {
