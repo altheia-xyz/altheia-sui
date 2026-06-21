@@ -119,6 +119,12 @@ public(package) fun mint_and_share(
     pid
 }
 
+/// Share a by-value Policy (PTB-end step for `vault::mint_policy_open`). Policy
+/// is `key`-only, so sharing must originate here in its defining module.
+public fun share(p: Policy) {
+    transfer::share_object(p);
+}
+
 public(package) fun set_caps(
     policy: &mut Policy,
     new_per_tx_cap: u64,

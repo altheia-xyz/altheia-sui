@@ -122,6 +122,72 @@ public fun mint_agent_cap<T>(
     );
 }
 
+// === Single-PTB provisioning (composable, return-by-value) ===
+//
+// The functions above each share/transfer internally, which forces one
+// transaction per create-then-use boundary (vault, policy, cap = 3+ sigs).
+// These return the objects BY VALUE so a single PTB can chain
+// provision -> deposit -> mint_policy -> mint_agent_cap and share at the end,
+// collapsing the flow to ONE owner signature. Callers MUST share the vault
+// (share_vault) and policy (policy::share) before the PTB completes, or the
+// objects are dropped (compile error — neither has `drop`).
+
+/// Provision a vault returning it (and the OwnerCap) by value, unshared.
+public fun provision_open<T>(ctx: &mut TxContext): (Vault<T>, OwnerCap) {
+    let vault = Vault<T> {
+        id: object::new(ctx),
+        balance: balance::zero<T>(),
+        operator: ctx.sender(),
+    };
+    let vault_id = object::id(&vault);
+    let owner = OwnerCap { id: object::new(ctx), vault_id };
+    (vault, owner)
+}
+
+/// Share a by-value Vault (PTB-end step for `provision_open`).
+public fun share_vault<T>(vault: Vault<T>) {
+    transfer::share_object(vault);
+}
+
+/// Mint a policy returning it BY VALUE (unshared), value-guard folded in so no
+/// separate set-params tx is needed. Caller shares it via `policy::share`.
+public fun mint_policy_open<T>(
+    vault: &Vault<T>,
+    owner: &OwnerCap,
+    agent_id: vector<u8>,
+    per_tx_cap: u64,
+    per_day_cap: u64,
+    allowed_packages: vector<address>,
+    allowed_actions: vector<u8>,
+    expires_at_ms: u64,
+    max_slippage_bps: u64,
+    base_scalar: u64,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): Policy {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    let mut p = policy::new(
+        agent_id, per_tx_cap, per_day_cap, allowed_packages, allowed_actions, expires_at_ms, clock, ctx,
+    );
+    if (max_slippage_bps > 0 || base_scalar > 0) {
+        policy::set_value_guard(&mut p, max_slippage_bps, base_scalar, clock);
+    };
+    p
+}
+
+/// Mint an AgentCap from a by-value Policy (reads its id), for single-PTB use.
+public fun mint_agent_cap_for<T>(
+    vault: &Vault<T>,
+    owner: &OwnerCap,
+    policy: &Policy,
+    agent_id: vector<u8>,
+    agent_addr: address,
+    ctx: &mut TxContext,
+) {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    agent::mint_and_transfer(agent_id, object::id(vault), object::id(policy), agent_addr, ctx);
+}
+
 // === Admin (owner-gated policy mutations) ===
 
 public fun admin_update_policy_caps<T>(
