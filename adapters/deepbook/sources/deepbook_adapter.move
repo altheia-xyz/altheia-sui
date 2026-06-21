@@ -83,7 +83,7 @@ public fun compute_min_base_out(
 /// Aborts: ENotAllowedAction / EValueGuardNotConfigured / (policy caps/scope/
 /// revoked/paused/expiry) / ENotApprovedAdapter / EUnderMinValue.
 public fun execute_swap_quote_for_base<Base, Quote>(
-    vault: &mut Vault<Quote>,
+    vault: &mut Vault,
     cap: &AgentCap,
     policy: &mut Policy,
     pool: &mut Pool<Base, Quote>,
@@ -99,8 +99,8 @@ public fun execute_swap_quote_for_base<Base, Quote>(
     let min_rate = policy::action_params(policy, actions::deepbook_swap())[0];
 
     let target_pool = object::id(pool).to_address();
-    // withdraw runs check_and_consume first → revoke/pause/expiry/caps/scope.
-    let (coin_in, r) = vault::withdraw_with_receipt(
+    // withdraw runs check_and_consume<Quote> first → revoke/pause/expiry/cap/scope.
+    let (coin_in, r) = vault::withdraw_with_receipt<Quote>(
         vault, cap, policy, amount, target_pool, recipient, b"SWAP", clock, ctx,
     );
     let deep_in = coin::zero<DEEP>(ctx);
@@ -112,7 +112,43 @@ public fun execute_swap_quote_for_base<Base, Quote>(
     receipt::consume_with_check<DeepBookWitness, Base>(
         DeepBookWitness {}, registry, r, &base_out, min_out, recipient,
     );
-    transfer::public_transfer(base_out, recipient);
-    transfer::public_transfer(quote_left, recipient);
-    transfer::public_transfer(deep_left, recipient);
+    // Settle back INTO the vault so the agent holds the position and can later
+    // sell it (round-trip). Funds never leave the operator's vault on a swap.
+    vault::deposit(vault, base_out);
+    vault::deposit(vault, quote_left);
+    vault::deposit(vault, deep_left);
+}
+
+/// Reverse direction: sell Base for Quote (unwind a position). The input Base is
+/// withdrawn from the vault — if it's an uncapped position asset, the core lets
+/// it through (selling reduces risk); if the operator capped Base, the cap
+/// applies. Proceeds (Quote) settle back into the vault. No value-guard floor on
+/// the sell side yet (the operator's risk gate was the buy); a sell-side floor
+/// is a follow-up.
+public fun execute_swap_base_for_quote<Base, Quote>(
+    vault: &mut Vault,
+    cap: &AgentCap,
+    policy: &mut Policy,
+    pool: &mut Pool<Base, Quote>,
+    registry: &AdapterRegistry,
+    amount: u64,
+    recipient: address,
+    clock: &Clock,
+    ctx: &mut TxContext,
+) {
+    policy::assert_allows(policy, actions::deepbook_swap());
+    let target_pool = object::id(pool).to_address();
+    let (coin_in, r) = vault::withdraw_with_receipt<Base>(
+        vault, cap, policy, amount, target_pool, recipient, b"SWAP", clock, ctx,
+    );
+    let deep_in = coin::zero<DEEP>(ctx);
+    let (base_left, quote_out, deep_left) = dbpool::swap_exact_base_for_quote<Base, Quote>(
+        pool, coin_in, deep_in, 0, clock, ctx,
+    );
+    receipt::consume_with_check<DeepBookWitness, Quote>(
+        DeepBookWitness {}, registry, r, &quote_out, 0, recipient,
+    );
+    vault::deposit(vault, quote_out);
+    vault::deposit(vault, base_left);
+    vault::deposit(vault, deep_left);
 }
