@@ -6,128 +6,192 @@ use sui::test_scenario as ts;
 use sui::test_utils;
 use sui::clock;
 use sui::coin;
-use altheia::vault::{Self, Vault};
+use altheia::vault::{Self, Vault, OwnerCap};
 use altheia::policy::{Self, Policy};
-use altheia::actions;
 use altheia::agent::AgentCap;
 use altheia::receipt;
-use altheia::registry::{Self, AdapterRegistry};
-use altheia::test_support::{Self, AdapterW};
 
 const OPERATOR: address = @0xCAFE;
 const AGENT: address = @0xBEEF;
-const RECIPIENT: address = @0xFACE;
+const POOL: address = @0x90;
 
-// Single-PTB provisioning: provision_open + deposit + mint_policy_open +
-// mint_agent_cap_for compose without intermediate sharing, and the swap
-// value-guard (action_params[deepbook_swap]) is set so the adapter won't abort
-// EActionConfigMissing. This is the contract side of the one-signature mint.
-#[test]
-fun test_single_ptb_provision_sets_swap_action_params() {
-    let mut scenario = ts::begin(OPERATOR);
-    let clk = clock::create_for_testing(ts::ctx(&mut scenario));
+// Two distinct coin types for the multi-asset cases. USDC is a budget asset
+// (capped); DEEP stands in for an asset acquired via a swap (uncapped).
+public struct USDC has drop {}
+public struct DEEP has drop {}
 
-    // returns vault + owner BY VALUE (unshared) for one-PTB composition
-    let (mut v, owner) = vault::provision_open<SUI>(ts::ctx(&mut scenario));
-    let funds = coin::mint_for_testing<SUI>(2_000, ts::ctx(&mut scenario));
-    vault::deposit(&mut v, funds);
-    assert!(vault::balance(&v) == 2_000, 0);
+const SWAP: u8 = 1; // deepbook_swap action id (mirrors altheia::actions)
 
-    let p = vault::mint_policy_with_guard<SUI>(
-        &v, &owner, b"agent-ptb", 500, 2_000, vector[@0x123], vector[1], 9_999_999_999_999, 15_000_000, &clk, ts::ctx(&mut scenario),
-    );
-    // the bug this guards against: a single-PTB policy with no swap action-param
-    assert!(policy::has_action_params(&p, actions::deepbook_swap()), 1);
-    assert!(policy::action_params(&p, actions::deepbook_swap())[0] == 15_000_000, 2);
-
-    vault::mint_agent_cap_for<SUI>(&v, &owner, &p, b"agent-ptb", AGENT, ts::ctx(&mut scenario));
-
-    // PTB-end: consume the by-value objects (share / hand to owner)
-    policy::share(p);
-    vault::share_vault(v);
-    test_utils::destroy(owner);
-    clock::destroy_for_testing(clk);
-    ts::end(scenario);
+/// Provision a multi-asset vault funded with USDC + DEEP, a policy that caps
+/// USDC only and allows the swap action on POOL, and an AgentCap for AGENT.
+/// Vault + policy are shared; OwnerCap goes to OPERATOR.
+fun setup(s: &mut ts::Scenario, clk: &clock::Clock, usdc_amt: u64, deep_amt: u64, per_tx: u64, per_day: u64) {
+    let (mut vault, owner) = vault::provision_open(ts::ctx(s));
+    vault::deposit<USDC>(&mut vault, coin::mint_for_testing<USDC>(usdc_amt, ts::ctx(s)));
+    vault::deposit<DEEP>(&mut vault, coin::mint_for_testing<DEEP>(deep_amt, ts::ctx(s)));
+    let mut policy = vault::mint_policy_open(&vault, &owner, b"agent-1", vector[POOL], vector[SWAP], 9_999_999_999_999, ts::ctx(s));
+    vault::add_asset_cap<USDC>(&vault, &owner, &mut policy, per_tx, per_day, clk);
+    vault::mint_agent_cap_for(&vault, &owner, &policy, b"agent-1", AGENT, ts::ctx(s));
+    vault::share_vault(vault);
+    policy::share(policy);
+    transfer::public_transfer(owner, OPERATOR);
 }
 
+// 1. Multi-asset provisioning: one vault holds two coin types; the policy caps
+//    only the budget asset; the asset list records both.
 #[test]
-fun test_provision_creates_vault_and_returns_owner() {
-    let mut scenario = ts::begin(OPERATOR);
-    let owner = vault::provision<SUI>(ts::ctx(&mut scenario));
-    test_utils::destroy(owner);
-    ts::end(scenario);
-}
-
-#[test]
-fun test_deposit_increases_balance() {
-    let mut scenario = ts::begin(OPERATOR);
-    let owner = vault::provision<SUI>(ts::ctx(&mut scenario));
-    ts::next_tx(&mut scenario, OPERATOR);
-    let mut v = ts::take_shared<Vault<SUI>>(&scenario);
-    let c = coin::mint_for_testing<SUI>(1_000, ts::ctx(&mut scenario));
-    vault::deposit(&mut v, c);
-    assert!(vault::balance(&v) == 1_000, 0);
+fun test_multi_asset_provision() {
+    let mut s = ts::begin(OPERATOR);
+    let clk = clock::create_for_testing(ts::ctx(&mut s));
+    setup(&mut s, &clk, 1_000, 500, 100, 1_000);
+    ts::next_tx(&mut s, OPERATOR);
+    let v = ts::take_shared<Vault>(&s);
+    let p = ts::take_shared<Policy>(&s);
+    assert!(vault::balance<USDC>(&v) == 1_000, 0);
+    assert!(vault::balance<DEEP>(&v) == 500, 1);
+    assert!(vault::assets(&v).length() == 2, 2);
+    assert!(policy::has_asset_cap<USDC>(&p), 3);
+    assert!(!policy::has_asset_cap<DEEP>(&p), 4); // DEEP uncapped
     ts::return_shared(v);
-    test_utils::destroy(owner);
-    ts::end(scenario);
-}
-
-// Owner kill-switch drain: empties the vault back to the owner.
-#[test]
-fun test_admin_withdraw_all_drains_to_owner() {
-    let mut scenario = ts::begin(OPERATOR);
-    let owner = vault::provision<SUI>(ts::ctx(&mut scenario));
-    ts::next_tx(&mut scenario, OPERATOR);
-    let mut v = ts::take_shared<Vault<SUI>>(&scenario);
-    let funds = coin::mint_for_testing<SUI>(1_000, ts::ctx(&mut scenario));
-    vault::deposit(&mut v, funds);
-    let c = vault::admin_withdraw_all<SUI>(&mut v, &owner, ts::ctx(&mut scenario));
-    assert!(coin::value(&c) == 1_000, 0);
-    assert!(vault::balance(&v) == 0, 1);
-    test_utils::destroy(c);
-    ts::return_shared(v);
-    test_utils::destroy(owner);
-    ts::end(scenario);
-}
-
-#[test]
-fun test_withdraw_with_receipt_returns_coin_and_receipt() {
-    let mut scenario = ts::begin(OPERATOR);
-    let owner = vault::provision<SUI>(ts::ctx(&mut scenario));
-    let clk = clock::create_for_testing(ts::ctx(&mut scenario));
-    let regcap = registry::create(ts::ctx(&mut scenario));
-    ts::next_tx(&mut scenario, OPERATOR);
-    // approve the (test) adapter witness so the receipt can be closed
-    let mut reg = ts::take_shared<AdapterRegistry>(&scenario);
-    registry::add_adapter<AdapterW>(&mut reg, &regcap);
-    ts::return_shared(reg);
-    // fund + provision the agent
-    let mut v = ts::take_shared<Vault<SUI>>(&scenario);
-    let funds = coin::mint_for_testing<SUI>(1_000, ts::ctx(&mut scenario));
-    vault::deposit(&mut v, funds);
-    let pid = vault::mint_policy(
-        &v, &owner, b"agent-1", 100, 500, vector[@0x0], vector[], 1_000_000_000, &clk, ts::ctx(&mut scenario),
-    );
-    vault::mint_agent_cap(&v, &owner, pid, b"agent-1", AGENT, ts::ctx(&mut scenario));
-    ts::return_shared(v);
-
-    ts::next_tx(&mut scenario, AGENT);
-    let cap = ts::take_from_sender<AgentCap>(&scenario);
-    let mut p = ts::take_shared<Policy>(&scenario);
-    let mut v = ts::take_shared<Vault<SUI>>(&scenario);
-    let reg = ts::take_shared<AdapterRegistry>(&scenario);
-    let (coin_out, r) = vault::withdraw_with_receipt(
-        &mut v, &cap, &mut p, 50, @0x0, RECIPIENT, b"SUI", &clk, ts::ctx(&mut scenario),
-    );
-    // close the hot potato through the gated, approved-adapter path
-    receipt::consume_with_check<AdapterW, SUI>(test_support::witness(), &reg, r, &coin_out, 0, RECIPIENT);
-    test_utils::destroy(coin_out);
-    test_utils::destroy(cap);
-    ts::return_shared(reg);
     ts::return_shared(p);
-    ts::return_shared(v);
     clock::destroy_for_testing(clk);
-    test_utils::destroy(owner);
-    test_utils::destroy(regcap);
-    ts::end(scenario);
+    ts::end(s);
+}
+
+// 2. Budget asset within cap: withdraw succeeds and records spend.
+#[test]
+fun test_withdraw_budget_asset_within_cap() {
+    let mut s = ts::begin(OPERATOR);
+    let clk = clock::create_for_testing(ts::ctx(&mut s));
+    setup(&mut s, &clk, 1_000, 0, 100, 1_000);
+    ts::next_tx(&mut s, AGENT);
+    let mut v = ts::take_shared<Vault>(&s);
+    let mut p = ts::take_shared<Policy>(&s);
+    let cap = ts::take_from_sender<AgentCap>(&s);
+    let (coin_out, receipt) = vault::withdraw_with_receipt<USDC>(&mut v, &cap, &mut p, 80, POOL, OPERATOR, b"USDC", &clk, ts::ctx(&mut s));
+    assert!(coin::value(&coin_out) == 80, 0);
+    assert!(policy::spent_today<USDC>(&p) == 80, 1);
+    test_utils::destroy(coin_out);
+    receipt::destroy_for_testing(receipt);
+    ts::return_to_sender(&s, cap);
+    ts::return_shared(v);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    ts::end(s);
+}
+
+// 3. Budget asset over per-tx cap aborts.
+#[test]
+#[expected_failure(abort_code = ::altheia::policy::ECapExceededPerTx)]
+fun test_withdraw_over_per_tx_aborts() {
+    let mut s = ts::begin(OPERATOR);
+    let clk = clock::create_for_testing(ts::ctx(&mut s));
+    setup(&mut s, &clk, 1_000, 0, 100, 1_000);
+    ts::next_tx(&mut s, AGENT);
+    let mut v = ts::take_shared<Vault>(&s);
+    let mut p = ts::take_shared<Policy>(&s);
+    let cap = ts::take_from_sender<AgentCap>(&s);
+    let (coin_out, receipt) = vault::withdraw_with_receipt<USDC>(&mut v, &cap, &mut p, 101, POOL, OPERATOR, b"USDC", &clk, ts::ctx(&mut s));
+    test_utils::destroy(coin_out);
+    receipt::destroy_for_testing(receipt);
+    ts::return_to_sender(&s, cap);
+    ts::return_shared(v);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    ts::end(s);
+}
+
+// 4. FLAG #1: an uncapped position asset (DEEP from a swap) is SELLABLE — the
+//    withdrawal does NOT abort, so it isn't trapped; nothing is recorded.
+#[test]
+fun test_uncapped_position_is_sellable() {
+    let mut s = ts::begin(OPERATOR);
+    let clk = clock::create_for_testing(ts::ctx(&mut s));
+    setup(&mut s, &clk, 1_000, 500, 100, 1_000);
+    ts::next_tx(&mut s, AGENT);
+    let mut v = ts::take_shared<Vault>(&s);
+    let mut p = ts::take_shared<Policy>(&s);
+    let cap = ts::take_from_sender<AgentCap>(&s);
+    let (coin_out, receipt) = vault::withdraw_with_receipt<DEEP>(&mut v, &cap, &mut p, 500, POOL, OPERATOR, b"DEEP", &clk, ts::ctx(&mut s));
+    assert!(coin::value(&coin_out) == 500, 0);
+    assert!(policy::spent_today<DEEP>(&p) == 0, 1); // uncapped: nothing recorded
+    test_utils::destroy(coin_out);
+    receipt::destroy_for_testing(receipt);
+    ts::return_to_sender(&s, cap);
+    ts::return_shared(v);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    ts::end(s);
+}
+
+// 5. Exfil gate: a position asset (uncapped) cannot be transferred out.
+#[test]
+#[expected_failure(abort_code = ::altheia::policy::EAssetNotAllowed)]
+fun test_uncapped_position_not_transferable() {
+    let mut s = ts::begin(OPERATOR);
+    let clk = clock::create_for_testing(ts::ctx(&mut s));
+    setup(&mut s, &clk, 1_000, 500, 100, 1_000);
+    ts::next_tx(&mut s, OPERATOR);
+    let p = ts::take_shared<Policy>(&s);
+    policy::assert_transferable<DEEP>(&p); // aborts — DEEP has no cap
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    ts::end(s);
+}
+
+// 6. FLAG #2: after revoke, the OWNER drains ALL assets — including the uncapped
+//    DEEP — back to their wallet. Caps never restrict the owner.
+#[test]
+fun test_owner_drains_all_assets_after_revoke() {
+    let mut s = ts::begin(OPERATOR);
+    let clk = clock::create_for_testing(ts::ctx(&mut s));
+    setup(&mut s, &clk, 1_000, 500, 100, 1_000);
+    ts::next_tx(&mut s, OPERATOR);
+    let mut v = ts::take_shared<Vault>(&s);
+    let mut p = ts::take_shared<Policy>(&s);
+    let owner = ts::take_from_sender<OwnerCap>(&s);
+    vault::admin_revoke_policy(&v, &owner, &mut p, &clk);
+    assert!(policy::is_revoked(&p), 0);
+    let usdc = vault::admin_withdraw_all<USDC>(&mut v, &owner, ts::ctx(&mut s));
+    let deep = vault::admin_withdraw_all<DEEP>(&mut v, &owner, ts::ctx(&mut s));
+    assert!(coin::value(&usdc) == 1_000, 1);
+    assert!(coin::value(&deep) == 500, 2); // uncapped position recovered by owner
+    assert!(vault::balance<USDC>(&v) == 0, 3);
+    assert!(vault::balance<DEEP>(&v) == 0, 4);
+    test_utils::destroy(usdc);
+    test_utils::destroy(deep);
+    ts::return_to_sender(&s, owner);
+    ts::return_shared(v);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    ts::end(s);
+}
+
+// 7. After revoke, the agent's withdrawal aborts.
+#[test]
+#[expected_failure(abort_code = ::altheia::policy::EPolicyRevoked)]
+fun test_withdraw_after_revoke_aborts() {
+    let mut s = ts::begin(OPERATOR);
+    let clk = clock::create_for_testing(ts::ctx(&mut s));
+    setup(&mut s, &clk, 1_000, 0, 100, 1_000);
+    ts::next_tx(&mut s, OPERATOR);
+    let mut p = ts::take_shared<Policy>(&s);
+    let v0 = ts::take_shared<Vault>(&s);
+    let owner = ts::take_from_sender<OwnerCap>(&s);
+    vault::admin_revoke_policy(&v0, &owner, &mut p, &clk);
+    ts::return_to_sender(&s, owner);
+    ts::return_shared(v0);
+    ts::return_shared(p);
+    ts::next_tx(&mut s, AGENT);
+    let mut v = ts::take_shared<Vault>(&s);
+    let mut p2 = ts::take_shared<Policy>(&s);
+    let cap = ts::take_from_sender<AgentCap>(&s);
+    let (coin_out, receipt) = vault::withdraw_with_receipt<USDC>(&mut v, &cap, &mut p2, 10, POOL, OPERATOR, b"USDC", &clk, ts::ctx(&mut s));
+    test_utils::destroy(coin_out);
+    receipt::destroy_for_testing(receipt);
+    ts::return_to_sender(&s, cap);
+    ts::return_shared(v);
+    ts::return_shared(p2);
+    clock::destroy_for_testing(clk);
+    ts::end(s);
 }

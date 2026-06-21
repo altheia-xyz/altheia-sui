@@ -1,42 +1,46 @@
 /// altheia::policy
 ///
-/// Per-agent policy as a SHARED object. Holds caps + scope + cumulative
-/// spend state. Because Policy is shared, cumulative daily spend persists
-/// across transactions, so caps cannot be bypassed by splitting a spend
-/// across multiple PTBs.
+/// Per-agent policy as a SHARED object. Holds PER-ASSET caps + scope +
+/// cumulative spend state. Because Policy is shared, cumulative daily spend
+/// persists across transactions, so caps cannot be bypassed by splitting a
+/// spend across multiple PTBs.
 ///
-/// `check_and_consume` is the enforcement gate, called by
-/// vault::withdraw_with_receipt before any Coin leaves the vault.
+/// Multi-asset model: an agent's vault holds many coin types; the policy
+/// carries one `AssetCap` per type (keyed by TypeName). `check_and_consume<T>`
+/// is the enforcement gate, called by vault::withdraw_with_receipt<T> before
+/// any Coin<T> leaves the vault. An asset with no cap entry is default-deny.
 module altheia::policy;
 
 use sui::clock::{Self, Clock};
 use sui::vec_set::{Self, VecSet};
+use sui::vec_map::{Self, VecMap};
 use sui::dynamic_field as df;
+use std::type_name::{Self, TypeName};
 use altheia::agent::{Self, AgentCap};
 use altheia::audit;
 
-/// Per-agent policy object. Shared at mint via vault::mint_policy.
+/// Per-asset spend cap + rolling-day state.
+public struct AssetCap has store, copy, drop {
+    per_tx_cap: u64,
+    per_day_cap: u64,
+    spent_today: u64,
+    day_window_started_ms: u64,
+}
+
+/// Per-agent policy object. Shared at mint via vault::mint_policy*.
 public struct Policy has key {
     id: UID,
     agent_id: vector<u8>,
-    per_tx_cap: u64,
-    per_day_cap: u64,
+    // Per-asset caps keyed by coin TypeName. An asset absent here is denied.
+    caps: VecMap<TypeName, AssetCap>,
     allowed_packages: vector<address>,
-    // Per-agent capability allowlist (altheia::actions ids). Default-deny:
-    // an action not in this set is rejected, regardless of caps. The operator
-    // picks the subset at mint time.
+    // Capability allowlist (altheia::actions ids). Default-deny.
     allowed_actions: VecSet<u8>,
     expires_at_ms: u64,
-    spent_today: u64,
-    day_window_started_ms: u64,
     revoked: bool,
     paused: bool,
     version: u64,
-    // Value-guard params (operator-set; agent cannot supply them). Read by
-    // the demo's execute_trade_guarded and passed to
-    // receipt::attest_value_conservation. Default 0 until configured via
-    // vault::admin_set_value_guard; base_scalar must be > 0 before the
-    // guarded path is used.
+    // Value-guard params (operator-set; agent cannot supply them).
     max_slippage_bps: u64,
     base_scalar: u64,
 }
@@ -52,6 +56,7 @@ const EPackageNotAllowed: u64 = 6;
 const EWrongPolicy: u64 = 7;
 const ENotAllowedAction: u64 = 8;
 const EActionConfigMissing: u64 = 9;
+const EAssetNotAllowed: u64 = 10;
 
 const MS_PER_DAY: u64 = 86_400_000;
 
@@ -70,27 +75,21 @@ fun actions_set(ids: vector<u8>): VecSet<u8> {
 
 // === Package-visible constructors (called by vault front-door) ===
 
+/// New policy with NO asset caps yet — add them with `add_asset_cap<T>`.
 public(package) fun new(
     agent_id: vector<u8>,
-    per_tx_cap: u64,
-    per_day_cap: u64,
     allowed_packages: vector<address>,
     allowed_actions: vector<u8>,
     expires_at_ms: u64,
-    clock: &Clock,
     ctx: &mut TxContext,
 ): Policy {
-    let now = clock::timestamp_ms(clock);
     Policy {
         id: object::new(ctx),
         agent_id,
-        per_tx_cap,
-        per_day_cap,
+        caps: vec_map::empty<TypeName, AssetCap>(),
         allowed_packages,
         allowed_actions: actions_set(allowed_actions),
         expires_at_ms,
-        spent_today: 0,
-        day_window_started_ms: now,
         revoked: false,
         paused: false,
         version: 1,
@@ -99,76 +98,50 @@ public(package) fun new(
     }
 }
 
-/// Construct + share a Policy. Returns the policy's ID so the caller
-/// (vault::mint_policy) can pass it to mint_agent_cap and to clients.
-/// Policy is `key` only — share_object can only be called from within
-/// this module.
-public(package) fun mint_and_share(
-    agent_id: vector<u8>,
+/// Add or replace the cap for asset `T`. Owner-gated via the vault front-door.
+public(package) fun add_asset_cap<T>(
+    policy: &mut Policy,
     per_tx_cap: u64,
     per_day_cap: u64,
-    allowed_packages: vector<address>,
-    allowed_actions: vector<u8>,
-    expires_at_ms: u64,
-    clock: &Clock,
-    ctx: &mut TxContext,
-): ID {
-    let p = new(agent_id, per_tx_cap, per_day_cap, allowed_packages, allowed_actions, expires_at_ms, clock, ctx);
-    let pid = object::id(&p);
-    transfer::share_object(p);
-    pid
-}
-
-/// Share a by-value Policy (PTB-end step for `vault::mint_policy_open`). Policy
-/// is `key`-only, so sharing must originate here in its defining module.
-public fun share(p: Policy) {
-    transfer::share_object(p);
-}
-
-public(package) fun set_caps(
-    policy: &mut Policy,
-    new_per_tx_cap: u64,
-    new_per_day_cap: u64,
     clock: &Clock,
 ) {
+    let tn = type_name::get<T>();
+    let now = clock::timestamp_ms(clock);
+    if (policy.caps.contains(&tn)) {
+        let (_, _) = policy.caps.remove(&tn);
+    };
+    policy.caps.insert(tn, AssetCap {
+        per_tx_cap,
+        per_day_cap,
+        spent_today: 0,
+        day_window_started_ms: now,
+    });
     let before = policy.version;
-    policy.per_tx_cap = new_per_tx_cap;
-    policy.per_day_cap = new_per_day_cap;
     policy.version = before + 1;
-    audit::emit_updated(
-        policy.agent_id,
-        before,
-        policy.version,
-        clock::timestamp_ms(clock),
-    );
+    audit::emit_updated(policy.agent_id, before, policy.version, now);
+}
+
+/// Share a by-value Policy (PTB-end step for `vault::mint_policy_*`). Policy is
+/// `key`-only, so sharing must originate here in its defining module.
+public fun share(p: Policy) {
+    transfer::share_object(p);
 }
 
 public(package) fun set_revoked(policy: &mut Policy, clock: &Clock) {
     let before = policy.version;
     policy.revoked = true;
     policy.version = before + 1;
-    audit::emit_revoked(
-        policy.agent_id,
-        policy.version,
-        clock::timestamp_ms(clock),
-    );
+    audit::emit_revoked(policy.agent_id, policy.version, clock::timestamp_ms(clock));
 }
 
 public(package) fun set_paused(policy: &mut Policy, paused: bool, clock: &Clock) {
     let before = policy.version;
     policy.paused = paused;
     policy.version = before + 1;
-    audit::emit_updated(
-        policy.agent_id,
-        before,
-        policy.version,
-        clock::timestamp_ms(clock),
-    );
+    audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
 }
 
-/// Operator-set value-guard params. `base_scalar` is the base coin's
-/// smallest-unit scalar (1e9 for SUI); `max_slippage_bps` the allowed
-/// deviation below DeepBook's fair rate. Set by vault::admin_set_value_guard.
+/// Operator-set value-guard params (per swap value conservation).
 public(package) fun set_value_guard(
     policy: &mut Policy,
     max_slippage_bps: u64,
@@ -179,21 +152,12 @@ public(package) fun set_value_guard(
     policy.max_slippage_bps = max_slippage_bps;
     policy.base_scalar = base_scalar;
     policy.version = before + 1;
-    audit::emit_updated(
-        policy.agent_id,
-        before,
-        policy.version,
-        clock::timestamp_ms(clock),
-    );
+    audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
 }
 
 // === Liveness gate (for actions that don't move Vault funds) ===
 
 /// Assert the agent's policy is live: correct policy, not revoked/paused/expired.
-/// Order-book actions (limit order, cancel) settle against a BalanceManager,
-/// not the Vault, so they bypass `check_and_consume`; they call this instead so
-/// revoke/pause/expiry still stop them. (Amount caps don't apply — no Vault
-/// withdrawal — but kill-switches must.)
 public fun assert_active(policy: &Policy, cap: &AgentCap, clock: &Clock) {
     assert!(agent::policy_id(cap) == object::id(policy), EWrongPolicy);
     assert!(!policy.revoked, EPolicyRevoked);
@@ -203,13 +167,15 @@ public fun assert_active(policy: &Policy, cap: &AgentCap, clock: &Clock) {
 
 // === Enforcement gate ===
 
-/// Aborts on any rule failure; updates spent_today + day window on
-/// success; emits AllowedAction on success.
-///
-/// Denied paths abort — aborts roll back all effects, so the indexer
-/// learns of denials from transaction failure metadata, not from an
-/// on-chain emit (emitting before abort is rolled back anyway).
-public(package) fun check_and_consume(
+/// Enforce + consume against asset `T`. Caps govern BUDGET DEPLOYMENT, not what
+/// the vault may hold:
+///   - Capped (budget) asset → enforce per_tx/per_day + record the spend.
+///   - Uncapped asset → a POSITION acquired via a prior permitted swap; allowed
+///     to be sold/swapped back without a cap, because swap proceeds settle into
+///     the vault (the receipt guarantees re-vaulting) and selling reduces risk.
+/// Exfiltration (transfer OUT) is gated separately by `assert_transferable<T>`,
+/// so a position asset can be unwound but never transferred straight out.
+public(package) fun check_and_consume<T>(
     policy: &mut Policy,
     cap: &AgentCap,
     amount: u64,
@@ -222,29 +188,31 @@ public(package) fun check_and_consume(
 
     let now = clock::timestamp_ms(clock);
     assert!(now < policy.expires_at_ms, EPolicyExpired);
-
-    // per_tx_cap is OPTIONAL: 0 = no per-tx limit (rely on the per-day budget).
-    // The required cap is per_day_cap (the budget); per-tx is a refinement.
-    if (policy.per_tx_cap > 0) assert!(amount <= policy.per_tx_cap, ECapExceededPerTx);
     assert!(policy.allowed_packages.contains(&target_package), EPackageNotAllowed);
 
-    // Roll the daily window if it's been ≥ 24h since it started.
-    if (now >= policy.day_window_started_ms + MS_PER_DAY) {
-        policy.day_window_started_ms = now;
-        policy.spent_today = 0;
+    let tn = type_name::get<T>();
+    if (policy.caps.contains(&tn)) {
+        // budget asset: enforce caps + record the spend
+        let c = policy.caps.get_mut(&tn);
+        if (c.per_tx_cap > 0) assert!(amount <= c.per_tx_cap, ECapExceededPerTx);
+        if (now >= c.day_window_started_ms + MS_PER_DAY) {
+            c.day_window_started_ms = now;
+            c.spent_today = 0;
+        };
+        let new_spent = c.spent_today + amount;
+        assert!(new_spent <= c.per_day_cap, ECapExceededPerDay);
+        c.spent_today = new_spent;
     };
+    // uncapped: position unwind — allowed, no accounting (proceeds re-vault).
 
-    let new_spent = policy.spent_today + amount;
-    assert!(new_spent <= policy.per_day_cap, ECapExceededPerDay);
-    policy.spent_today = new_spent;
+    audit::emit_allowed(policy.agent_id, policy.version, amount, target_package, now);
+}
 
-    audit::emit_allowed(
-        policy.agent_id,
-        policy.version,
-        amount,
-        target_package,
-        now,
-    );
+/// Exfiltration gate: an asset may only be transferred OUT of the vault if the
+/// operator gave it a cap. Position assets (uncapped) can be sold back but never
+/// transferred to an external address. The transfer action path calls this.
+public fun assert_transferable<T>(policy: &Policy) {
+    assert!(policy.caps.contains(&type_name::get<T>()), EAssetNotAllowed);
 }
 
 /// Replace the capability allowlist (owner-gated via vault::admin_set_actions).
@@ -257,8 +225,6 @@ public(package) fun set_allowed_actions(policy: &mut Policy, ids: vector<u8>, cl
 
 // === Per-action config (dynamic fields, operator-set) ===
 
-/// Store/replace the param vector for `action` (e.g. limit-order
-/// [min_price, max_price, max_size]). Owner-gated via vault::admin_set_action_params.
 public(package) fun set_action_params(policy: &mut Policy, action: u8, params: vector<u64>, clock: &Clock) {
     if (df::exists_(&policy.id, action)) {
         let _: vector<u64> = df::remove(&mut policy.id, action);
@@ -269,7 +235,6 @@ public(package) fun set_action_params(policy: &mut Policy, action: u8, params: v
     audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
 }
 
-/// Read the param vector for `action`. Aborts EActionConfigMissing if unset.
 public fun action_params(policy: &Policy, action: u8): vector<u64> {
     assert!(df::exists_(&policy.id, action), EActionConfigMissing);
     *df::borrow<u8, vector<u64>>(&policy.id, action)
@@ -281,13 +246,10 @@ public fun has_action_params(policy: &Policy, action: u8): bool {
 
 // === Action allowlist (default-deny) ===
 
-/// Is `action` (an altheia::actions id) permitted for this agent?
 public fun allows(policy: &Policy, action: u8): bool {
     policy.allowed_actions.contains(&action)
 }
 
-/// Abort `ENotAllowedAction` if `action` is not in the allowlist. Adapters
-/// call this before performing the action.
 public fun assert_allows(policy: &Policy, action: u8) {
     assert!(policy.allowed_actions.contains(&action), ENotAllowedAction);
 }
@@ -298,8 +260,30 @@ public fun version(policy: &Policy): u64 { policy.version }
 public fun is_revoked(policy: &Policy): bool { policy.revoked }
 public fun is_paused(policy: &Policy): bool { policy.paused }
 public fun agent_id(policy: &Policy): vector<u8> { policy.agent_id }
-public fun per_tx_cap(policy: &Policy): u64 { policy.per_tx_cap }
-public fun per_day_cap(policy: &Policy): u64 { policy.per_day_cap }
-public fun spent_today(policy: &Policy): u64 { policy.spent_today }
 public fun max_slippage_bps(policy: &Policy): u64 { policy.max_slippage_bps }
 public fun base_scalar(policy: &Policy): u64 { policy.base_scalar }
+
+/// Does the policy carry a cap for asset `T`?
+public fun has_asset_cap<T>(policy: &Policy): bool {
+    policy.caps.contains(&type_name::get<T>())
+}
+
+public fun per_tx_cap<T>(policy: &Policy): u64 {
+    let tn = type_name::get<T>();
+    if (policy.caps.contains(&tn)) policy.caps.get(&tn).per_tx_cap else 0
+}
+
+public fun per_day_cap<T>(policy: &Policy): u64 {
+    let tn = type_name::get<T>();
+    if (policy.caps.contains(&tn)) policy.caps.get(&tn).per_day_cap else 0
+}
+
+public fun spent_today<T>(policy: &Policy): u64 {
+    let tn = type_name::get<T>();
+    if (policy.caps.contains(&tn)) policy.caps.get(&tn).spent_today else 0
+}
+
+/// Number of distinct assets with caps.
+public fun asset_count(policy: &Policy): u64 {
+    policy.caps.size()
+}

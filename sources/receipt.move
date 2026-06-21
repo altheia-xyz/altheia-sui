@@ -50,6 +50,12 @@ public fun new_for_testing(
     new(agent_id, amount_in, asset_tag, recipient, policy_version, timestamp_ms)
 }
 
+/// Discard a receipt in tests (it's a hot potato — no `drop`).
+#[test_only]
+public fun destroy_for_testing(r: WithdrawalReceipt) {
+    let WithdrawalReceipt { agent_id: _, amount_in: _, asset_tag: _, recipient: _, policy_version: _, timestamp_ms: _ } = r;
+}
+
 /// Close the receipt. Callable only by an approved adapter:
 ///   - witness `W` proves the call originates from that adapter's module
 ///     (only it can construct its own witness type);
