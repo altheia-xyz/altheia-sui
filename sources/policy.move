@@ -57,8 +57,10 @@ const EWrongPolicy: u64 = 7;
 const ENotAllowedAction: u64 = 8;
 const EActionConfigMissing: u64 = 9;
 const EAssetNotAllowed: u64 = 10;
+const EInvalidValueGuard: u64 = 11;
 
 const MS_PER_DAY: u64 = 86_400_000;
+const BPS_DENOM: u64 = 10_000;
 
 /// Build a VecSet from a vector of action ids (dedupes).
 fun actions_set(ids: vector<u8>): VecSet<u8> {
@@ -107,14 +109,20 @@ public(package) fun add_asset_cap<T>(
 ) {
     let tn = type_name::get<T>();
     let now = clock::timestamp_ms(clock);
-    if (policy.caps.contains(&tn)) {
-        let (_, _) = policy.caps.remove(&tn);
+    // Preserve cumulative spend + window on re-set: re-issuing a cap mid-day
+    // must not reset the daily budget (else a compromised operator key could
+    // wipe spent_today at will). A new asset starts fresh at `now`.
+    let (spent_today, day_window_started_ms) = if (policy.caps.contains(&tn)) {
+        let (_, old) = policy.caps.remove(&tn);
+        (old.spent_today, old.day_window_started_ms)
+    } else {
+        (0, now)
     };
     policy.caps.insert(tn, AssetCap {
         per_tx_cap,
         per_day_cap,
-        spent_today: 0,
-        day_window_started_ms: now,
+        spent_today,
+        day_window_started_ms,
     });
     let before = policy.version;
     policy.version = before + 1;
@@ -148,6 +156,10 @@ public(package) fun set_value_guard(
     base_scalar: u64,
     clock: &Clock,
 ) {
+    // Slippage is a fraction of BPS_DENOM (>100% is meaningless); base_scalar is
+    // a divisor in the floor math, so zero would divide-by-zero.
+    assert!(max_slippage_bps <= BPS_DENOM, EInvalidValueGuard);
+    assert!(base_scalar > 0, EInvalidValueGuard);
     let before = policy.version;
     policy.max_slippage_bps = max_slippage_bps;
     policy.base_scalar = base_scalar;
@@ -199,9 +211,12 @@ public(package) fun check_and_consume<T>(
             c.day_window_started_ms = now;
             c.spent_today = 0;
         };
-        let new_spent = c.spent_today + amount;
-        assert!(new_spent <= c.per_day_cap, ECapExceededPerDay);
-        c.spent_today = new_spent;
+        // Checked: with per_tx_cap == 0 the amount is otherwise unbounded, so a
+        // near-u64::MAX amount would overflow `spent_today + amount` and abort
+        // with a raw arithmetic error instead of the clean cap error. The
+        // invariant spent_today <= per_day_cap keeps the subtraction safe.
+        assert!(amount <= c.per_day_cap - c.spent_today, ECapExceededPerDay);
+        c.spent_today = c.spent_today + amount;
     };
     // uncapped: position unwind — allowed, no accounting (proceeds re-vault).
 
