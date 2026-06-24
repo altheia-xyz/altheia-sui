@@ -23,6 +23,15 @@ fun min_out_no_overflow() {
     assert!(deepbook_adapter::compute_min_out(1_000_000_000_000, 794_000, 1_000_000_000, 50) == 790_030_000, 0);
 }
 
+// sell-side floor is opt-in via the 2nd action_param. unset ([]) and buy-only
+// ([min_rate]) configs yield no floor (0); a 2-element config yields the sell rate.
+#[test]
+fun sell_min_rate_optional() {
+    assert!(deepbook_adapter::sell_min_rate(&vector[]) == 0, 0);
+    assert!(deepbook_adapter::sell_min_rate(&vector[20_000_000u64]) == 0, 1);
+    assert!(deepbook_adapter::sell_min_rate(&vector[20_000_000u64, 15_000_000u64]) == 15_000_000, 2);
+}
+
 // operator-set rate guard: min_out = spent * min_rate / 1e9.
 #[test]
 fun min_out_from_rate_scaling() {

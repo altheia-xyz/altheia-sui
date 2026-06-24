@@ -1,8 +1,10 @@
 /// altheia_deepbook::deepbook_adapter
 ///
-/// Venue adapter for DeepBook v3. Reads the pool mid_price on-chain, computes
-/// the operator's fair-rate floor, and closes the core hot-potato receipt via
-/// `altheia::receipt::consume_with_check` with `DeepBookWitness`.
+/// Venue adapter for DeepBook v3. Closes the core hot-potato receipt via
+/// `altheia::receipt::consume_with_check` with `DeepBookWitness`, enforcing the
+/// operator-set rate floor on the received coin. The floor is operator-declared
+/// (action_params), not read from the pool; the `compute_min_out*` mid_price
+/// helpers below are provided for callers but not used by the live swap path.
 ///
 /// `DeepBookWitness` is the registry key: core checks its `type_name` against
 /// the on-chain `AdapterRegistry`, so this adapter can settle a withdrawal
@@ -26,6 +28,10 @@ use altheia::actions;
 /// closed by the DeepBook adapter and nothing else.
 public struct DeepBookWitness has drop {}
 
+/// A swap with a zero operator min_rate has no value floor — reject it rather
+/// than execute an unguarded swap.
+const EZeroMinRate: u64 = 1;
+
 const BPS_DENOM: u64 = 10_000;
 
 /// DeepBook price scaling: quote_qty = base_qty * mid_price / FLOAT_SCALING.
@@ -39,6 +45,14 @@ const RATE_SCALE: u128 = 1_000_000_000;
 /// `min_rate` (no oracle — the floor is operator-declared, not market-read).
 public fun min_out_from_rate(spent: u64, min_rate: u64): u64 {
     ((spent as u128) * (min_rate as u128) / RATE_SCALE) as u64
+}
+
+/// Pure: optional sell-side floor rate from `action_params`. `params[1]` is the
+/// sell min_rate (quote out per base spent); absent (length < 2) means no
+/// sell-side floor, preserving compatibility with buy-only `[min_rate]` configs
+/// already set on existing policies.
+public fun sell_min_rate(params: &vector<u64>): u64 {
+    if (params.length() >= 2) params[1] else 0
 }
 
 /// Pure: minimum acceptable output (quote base-units) for `amount_in` base
@@ -97,6 +111,9 @@ public fun execute_swap_quote_for_base<Base, Quote>(
     // Operator-set floor rate (base-units out per quote-unit in). No oracle, no
     // book dependency. action_params aborts EActionConfigMissing if unset.
     let min_rate = policy::action_params(policy, actions::deepbook_swap())[0];
+    // A zero min_rate floors min_out at 0 (no value guard). Reject rather than
+    // execute an unguarded swap — the operator must set a real floor.
+    assert!(min_rate > 0, EZeroMinRate);
 
     let target_pool = object::id(pool).to_address();
     // withdraw runs check_and_consume<Quote> first → revoke/pause/expiry/cap/scope.
@@ -122,9 +139,10 @@ public fun execute_swap_quote_for_base<Base, Quote>(
 /// Reverse direction: sell Base for Quote (unwind a position). The input Base is
 /// withdrawn from the vault — if it's an uncapped position asset, the core lets
 /// it through (selling reduces risk); if the operator capped Base, the cap
-/// applies. Proceeds (Quote) settle back into the vault. No value-guard floor on
-/// the sell side yet (the operator's risk gate was the buy); a sell-side floor
-/// is a follow-up.
+/// applies. Proceeds (Quote) settle back into the vault. Optional sell-side
+/// floor: if the operator set a second `action_params` element (`params[1]`),
+/// it is the sell min_rate and the proceeds must clear `min_out_from_rate`;
+/// absent, there is no sell floor (backward compatible with buy-only configs).
 public fun execute_swap_base_for_quote<Base, Quote>(
     vault: &mut Vault,
     cap: &AgentCap,
@@ -137,6 +155,10 @@ public fun execute_swap_base_for_quote<Base, Quote>(
     ctx: &mut TxContext,
 ) {
     policy::assert_allows(policy, actions::deepbook_swap());
+    // Optional operator sell-side floor (params[1]); 0 if unset → no floor.
+    let floor_rate = if (policy::has_action_params(policy, actions::deepbook_swap())) {
+        sell_min_rate(&policy::action_params(policy, actions::deepbook_swap()))
+    } else { 0 };
     let target_pool = object::id(pool).to_address();
     let (coin_in, r) = vault::withdraw_with_receipt<Base>(
         vault, cap, policy, amount, target_pool, recipient, b"SWAP", clock, ctx,
@@ -145,8 +167,10 @@ public fun execute_swap_base_for_quote<Base, Quote>(
     let (base_left, quote_out, deep_left) = dbpool::swap_exact_base_for_quote<Base, Quote>(
         pool, coin_in, deep_in, 0, clock, ctx,
     );
+    let spent = amount - coin::value(&base_left);
+    let min_out = min_out_from_rate(spent, floor_rate);
     receipt::consume_with_check<DeepBookWitness, Quote>(
-        DeepBookWitness {}, registry, r, &quote_out, 0, recipient,
+        DeepBookWitness {}, registry, r, &quote_out, min_out, recipient,
     );
     vault::deposit(vault, quote_out);
     vault::deposit(vault, base_left);
