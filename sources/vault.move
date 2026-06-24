@@ -90,9 +90,18 @@ public fun share_vault(vault: Vault) {
     transfer::share_object(vault);
 }
 
-/// Deposit any coin. Anyone can deposit; only the gated path withdraws. Records
-/// the type in `assets` on first deposit (incl. swap settlements).
-public fun deposit<T>(vault: &mut Vault, coin: Coin<T>) {
+/// Owner funds the vault.
+public fun admin_deposit<T>(vault: &mut Vault, owner: &OwnerCap, coin: Coin<T>) {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    deposit_balance(vault, coin.into_balance());
+}
+
+/// Settle funds INTO the vault on behalf of an agent — swap adapters re-vault
+/// proceeds here. Cap-gated so only an agent bound to THIS vault can add assets;
+/// a third party cannot grief the vault by depositing junk coin types (which
+/// would bloat the `assets` enumeration the owner's drain walks).
+public fun deposit_for<T>(vault: &mut Vault, cap: &AgentCap, coin: Coin<T>) {
+    assert!(agent::vault_id(cap) == object::id(vault), EWrongVault);
     deposit_balance(vault, coin.into_balance());
 }
 

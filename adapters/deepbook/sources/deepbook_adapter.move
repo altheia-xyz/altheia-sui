@@ -131,9 +131,9 @@ public fun execute_swap_quote_for_base<Base, Quote>(
     );
     // Settle back INTO the vault so the agent holds the position and can later
     // sell it (round-trip). Funds never leave the operator's vault on a swap.
-    vault::deposit(vault, base_out);
-    vault::deposit(vault, quote_left);
-    vault::deposit(vault, deep_left);
+    vault::deposit_for(vault, cap,base_out);
+    vault::deposit_for(vault, cap,quote_left);
+    vault::deposit_for(vault, cap,deep_left);
 }
 
 /// Reverse direction: sell Base for Quote (unwind a position). The input Base is
@@ -172,7 +172,7 @@ public fun execute_swap_base_for_quote<Base, Quote>(
     receipt::consume_with_check<DeepBookWitness, Quote>(
         DeepBookWitness {}, registry, r, &quote_out, min_out, recipient,
     );
-    vault::deposit(vault, quote_out);
-    vault::deposit(vault, base_left);
-    vault::deposit(vault, deep_left);
+    vault::deposit_for(vault, cap,quote_out);
+    vault::deposit_for(vault, cap,base_left);
+    vault::deposit_for(vault, cap,deep_left);
 }

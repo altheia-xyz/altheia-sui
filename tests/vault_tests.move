@@ -27,8 +27,8 @@ const SWAP: u8 = 1; // deepbook_swap action id (mirrors altheia::actions)
 /// Vault + policy are shared; OwnerCap goes to OPERATOR.
 fun setup(s: &mut ts::Scenario, clk: &clock::Clock, usdc_amt: u64, deep_amt: u64, per_tx: u64, per_day: u64) {
     let (mut vault, owner) = vault::provision_open(ts::ctx(s));
-    vault::deposit<USDC>(&mut vault, coin::mint_for_testing<USDC>(usdc_amt, ts::ctx(s)));
-    vault::deposit<DEEP>(&mut vault, coin::mint_for_testing<DEEP>(deep_amt, ts::ctx(s)));
+    vault::admin_deposit<USDC>(&mut vault, &owner, coin::mint_for_testing<USDC>(usdc_amt, ts::ctx(s)));
+    vault::admin_deposit<DEEP>(&mut vault, &owner, coin::mint_for_testing<DEEP>(deep_amt, ts::ctx(s)));
     let mut policy = vault::mint_policy_open(&vault, &owner, b"agent-1", vector[POOL], vector[SWAP], 9_999_999_999_999, ts::ctx(s));
     vault::add_asset_cap<USDC>(&vault, &owner, &mut policy, per_tx, per_day, clk);
     vault::mint_agent_cap_for(&vault, &owner, &policy, b"agent-1", AGENT, ts::ctx(s));
@@ -186,6 +186,23 @@ fun test_admin_rejects_policy_from_other_vault() {
     test_utils::destroy(owner_a);
     test_utils::destroy(owner_b);
     clock::destroy_for_testing(clk);
+    ts::end(s);
+}
+
+// 9. Deposits are authorized: an operator cannot fund a vault they don't own.
+//    Removing the open `deposit` is what blocks third-party junk-coin griefing.
+#[test]
+#[expected_failure(abort_code = ::altheia::vault::EWrongVault)]
+fun test_admin_deposit_rejects_foreign_owner() {
+    let mut s = ts::begin(OPERATOR);
+    let (vault_a, owner_a) = vault::provision_open(ts::ctx(&mut s));
+    let (mut vault_b, owner_b) = vault::provision_open(ts::ctx(&mut s));
+    // owner_a controls vault_a, not vault_b → funding vault_b with it aborts.
+    vault::admin_deposit<USDC>(&mut vault_b, &owner_a, coin::mint_for_testing<USDC>(100, ts::ctx(&mut s)));
+    vault::share_vault(vault_a);
+    vault::share_vault(vault_b);
+    test_utils::destroy(owner_a);
+    test_utils::destroy(owner_b);
     ts::end(s);
 }
 
