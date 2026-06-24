@@ -21,7 +21,11 @@ public struct AllowedAction has copy, drop {
     timestamp_ms: u64,
 }
 
-/// Emitted when an agent's action is denied by policy.
+/// Reserved. NOT emitted on-chain in practice: a policy denial is an `abort`,
+/// and an abort reverts every event emitted in the same transaction, so a
+/// denial can never surface as an on-chain event. Denials are recorded
+/// off-chain (failed-tx / dry-run). Kept (with `emit_denied`) for ABI stability
+/// and a possible future non-reverting denial-log path.
 public struct DeniedAction has copy, drop {
     agent_id: vector<u8>,
     policy_version: u64,
@@ -41,6 +45,19 @@ public struct PolicyRevoked has copy, drop {
 /// Emitted when a policy is updated (caps, scope, pause/unpause).
 public struct PolicyUpdated has copy, drop {
     agent_id: vector<u8>,
+    policy_version_before: u64,
+    policy_version_after: u64,
+    timestamp_ms: u64,
+}
+
+/// Discriminated policy-change event. `kind` distinguishes the change classes
+/// that the legacy `PolicyUpdated` event conflated (pause vs unpause vs cap vs
+/// value-guard vs action-set), so indexers can tell them apart without
+/// diffing object state. Emitted ALONGSIDE `PolicyUpdated` (dual-emit) so the
+/// existing indexer keeps working until it migrates to this event.
+public struct PolicyChanged has copy, drop {
+    agent_id: vector<u8>,
+    kind: u8,
     policy_version_before: u64,
     policy_version_after: u64,
     timestamp_ms: u64,
@@ -102,6 +119,30 @@ public(package) fun emit_revoked(
     event::emit(PolicyRevoked {
         agent_id,
         policy_version,
+        timestamp_ms,
+    });
+}
+
+// PolicyChanged discriminants. Public so the policy module (and indexers) name
+// them instead of bare integers; mirrors the `actions::*` id convention.
+public fun kind_pause(): u8 { 1 }
+public fun kind_unpause(): u8 { 2 }
+public fun kind_cap(): u8 { 3 }
+public fun kind_value_guard(): u8 { 4 }
+public fun kind_actions(): u8 { 5 }
+
+public(package) fun emit_changed(
+    agent_id: vector<u8>,
+    kind: u8,
+    policy_version_before: u64,
+    policy_version_after: u64,
+    timestamp_ms: u64,
+) {
+    event::emit(PolicyChanged {
+        agent_id,
+        kind,
+        policy_version_before,
+        policy_version_after,
         timestamp_ms,
     });
 }

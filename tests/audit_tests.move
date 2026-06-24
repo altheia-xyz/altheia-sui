@@ -15,5 +15,25 @@ fun test_audit_emit_signatures_link() {
     audit::emit_denied(b"agent-1", 1, 100, @0x0, b"per_tx_cap", 0);
     audit::emit_revoked(b"agent-1", 1, 0);
     audit::emit_updated(b"agent-1", 1, 2, 0);
+    audit::emit_changed(b"agent-1", audit::kind_pause(), 1, 2, 0);
     audit::emit_withdrawal_attested(b"agent-1", 100, 95, @0x1, 1, 0);
+}
+
+/// The five PolicyChanged discriminants must be distinct, else they can't
+/// disambiguate the change classes they name.
+#[test]
+fun test_policy_change_kinds_distinct() {
+    let kinds = vector[
+        audit::kind_pause(), audit::kind_unpause(), audit::kind_cap(),
+        audit::kind_value_guard(), audit::kind_actions(),
+    ];
+    let mut i = 0;
+    while (i < kinds.length()) {
+        let mut j = i + 1;
+        while (j < kinds.length()) {
+            assert!(kinds[i] != kinds[j], 0);
+            j = j + 1;
+        };
+        i = i + 1;
+    };
 }

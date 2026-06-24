@@ -127,6 +127,7 @@ public(package) fun add_asset_cap<T>(
     let before = policy.version;
     policy.version = before + 1;
     audit::emit_updated(policy.agent_id, before, policy.version, now);
+    audit::emit_changed(policy.agent_id, audit::kind_cap(), before, policy.version, now);
 }
 
 /// Share a by-value Policy (PTB-end step for `vault::mint_policy_*`). Policy is
@@ -146,7 +147,10 @@ public(package) fun set_paused(policy: &mut Policy, paused: bool, clock: &Clock)
     let before = policy.version;
     policy.paused = paused;
     policy.version = before + 1;
-    audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
+    let now = clock::timestamp_ms(clock);
+    let kind = if (paused) audit::kind_pause() else audit::kind_unpause();
+    audit::emit_updated(policy.agent_id, before, policy.version, now);
+    audit::emit_changed(policy.agent_id, kind, before, policy.version, now);
 }
 
 /// Operator-set value-guard params (per swap value conservation).
@@ -164,7 +168,9 @@ public(package) fun set_value_guard(
     policy.max_slippage_bps = max_slippage_bps;
     policy.base_scalar = base_scalar;
     policy.version = before + 1;
-    audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
+    let now = clock::timestamp_ms(clock);
+    audit::emit_updated(policy.agent_id, before, policy.version, now);
+    audit::emit_changed(policy.agent_id, audit::kind_value_guard(), before, policy.version, now);
 }
 
 // === Liveness gate (for actions that don't move Vault funds) ===
@@ -235,7 +241,9 @@ public(package) fun set_allowed_actions(policy: &mut Policy, ids: vector<u8>, cl
     let before = policy.version;
     policy.allowed_actions = actions_set(ids);
     policy.version = before + 1;
-    audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
+    let now = clock::timestamp_ms(clock);
+    audit::emit_updated(policy.agent_id, before, policy.version, now);
+    audit::emit_changed(policy.agent_id, audit::kind_actions(), before, policy.version, now);
 }
 
 // === Per-action config (dynamic fields, operator-set) ===
