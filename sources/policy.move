@@ -30,6 +30,10 @@ public struct AssetCap has store, copy, drop {
 /// Per-agent policy object. Shared at mint via vault::mint_policy*.
 public struct Policy has key {
     id: UID,
+    // The vault this policy governs. Bound at mint; every owner-gated mutation
+    // asserts the policy belongs to the vault, so an operator cannot touch
+    // another vault's policy (cross-vault tampering).
+    vault_id: ID,
     agent_id: vector<u8>,
     // Per-asset caps keyed by coin TypeName. An asset absent here is denied.
     caps: VecMap<TypeName, AssetCap>,
@@ -79,6 +83,7 @@ fun actions_set(ids: vector<u8>): VecSet<u8> {
 
 /// New policy with NO asset caps yet — add them with `add_asset_cap<T>`.
 public(package) fun new(
+    vault_id: ID,
     agent_id: vector<u8>,
     allowed_packages: vector<address>,
     allowed_actions: vector<u8>,
@@ -87,6 +92,7 @@ public(package) fun new(
 ): Policy {
     Policy {
         id: object::new(ctx),
+        vault_id,
         agent_id,
         caps: vec_map::empty<TypeName, AssetCap>(),
         allowed_packages,
@@ -280,6 +286,7 @@ public fun assert_allows(policy: &Policy, action: u8) {
 // === Accessors ===
 
 public fun version(policy: &Policy): u64 { policy.version }
+public fun policy_vault_id(policy: &Policy): ID { policy.vault_id }
 public fun is_revoked(policy: &Policy): bool { policy.revoked }
 public fun is_paused(policy: &Policy): bool { policy.paused }
 public fun agent_id(policy: &Policy): vector<u8> { policy.agent_id }

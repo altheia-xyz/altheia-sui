@@ -167,6 +167,28 @@ fun test_owner_drains_all_assets_after_revoke() {
     ts::end(s);
 }
 
+// 8. #2 cross-vault tampering: an operator cannot mutate a policy that belongs
+//    to a DIFFERENT vault, even holding a valid OwnerCap for their own vault.
+#[test]
+#[expected_failure(abort_code = ::altheia::vault::EWrongVault)]
+fun test_admin_rejects_policy_from_other_vault() {
+    let mut s = ts::begin(OPERATOR);
+    let clk = clock::create_for_testing(ts::ctx(&mut s));
+    let (vault_a, owner_a) = vault::provision_open(ts::ctx(&mut s));
+    let mut policy_a = vault::mint_policy_open(&vault_a, &owner_a, b"a", vector[POOL], vector[SWAP], 9_999_999_999_999, ts::ctx(&mut s));
+    let (vault_b, owner_b) = vault::provision_open(ts::ctx(&mut s));
+    // owner_b legitimately controls vault_b, but policy_a belongs to vault_a.
+    vault::admin_revoke_policy(&vault_b, &owner_b, &mut policy_a, &clk);
+    // Unreachable after the abort; present so every resource is consumed.
+    vault::share_vault(vault_a);
+    vault::share_vault(vault_b);
+    policy::share(policy_a);
+    test_utils::destroy(owner_a);
+    test_utils::destroy(owner_b);
+    clock::destroy_for_testing(clk);
+    ts::end(s);
+}
+
 // 7. After revoke, the agent's withdrawal aborts.
 #[test]
 #[expected_failure(abort_code = ::altheia::policy::EPolicyRevoked)]
