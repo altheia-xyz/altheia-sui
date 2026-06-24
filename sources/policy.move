@@ -132,7 +132,6 @@ public(package) fun add_asset_cap<T>(
     });
     let before = policy.version;
     policy.version = before + 1;
-    audit::emit_updated(policy.agent_id, before, policy.version, now);
     audit::emit_changed(policy.agent_id, audit::kind_cap(), before, policy.version, now);
 }
 
@@ -155,7 +154,6 @@ public(package) fun set_paused(policy: &mut Policy, paused: bool, clock: &Clock)
     policy.version = before + 1;
     let now = clock::timestamp_ms(clock);
     let kind = if (paused) audit::kind_pause() else audit::kind_unpause();
-    audit::emit_updated(policy.agent_id, before, policy.version, now);
     audit::emit_changed(policy.agent_id, kind, before, policy.version, now);
 }
 
@@ -175,7 +173,6 @@ public(package) fun set_value_guard(
     policy.base_scalar = base_scalar;
     policy.version = before + 1;
     let now = clock::timestamp_ms(clock);
-    audit::emit_updated(policy.agent_id, before, policy.version, now);
     audit::emit_changed(policy.agent_id, audit::kind_value_guard(), before, policy.version, now);
 }
 
@@ -248,7 +245,6 @@ public(package) fun set_allowed_actions(policy: &mut Policy, ids: vector<u8>, cl
     policy.allowed_actions = actions_set(ids);
     policy.version = before + 1;
     let now = clock::timestamp_ms(clock);
-    audit::emit_updated(policy.agent_id, before, policy.version, now);
     audit::emit_changed(policy.agent_id, audit::kind_actions(), before, policy.version, now);
 }
 
@@ -261,7 +257,7 @@ public(package) fun set_action_params(policy: &mut Policy, action: u8, params: v
     df::add(&mut policy.id, action, params);
     let before = policy.version;
     policy.version = before + 1;
-    audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
+    audit::emit_changed(policy.agent_id, audit::kind_action_params(), before, policy.version, clock::timestamp_ms(clock));
 }
 
 public fun action_params(policy: &Policy, action: u8): vector<u64> {

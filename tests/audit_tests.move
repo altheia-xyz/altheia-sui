@@ -12,9 +12,7 @@ use altheia::audit;
 #[test]
 fun test_audit_emit_signatures_link() {
     audit::emit_allowed(b"agent-1", 1, 100, @0x0, 0);
-    audit::emit_denied(b"agent-1", 1, 100, @0x0, b"per_tx_cap", 0);
     audit::emit_revoked(b"agent-1", 1, 0);
-    audit::emit_updated(b"agent-1", 1, 2, 0);
     audit::emit_changed(b"agent-1", audit::kind_pause(), 1, 2, 0);
     audit::emit_withdrawal_attested(b"agent-1", 100, 95, @0x1, 1, 0);
 }
