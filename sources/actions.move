@@ -21,3 +21,6 @@ public fun deepbook_limit_order(): u8 { 2 }
 
 /// DeepBook cancel of the agent's resting orders.
 public fun deepbook_cancel(): u8 { 3 }
+
+/// Cetus CLMM market swap, Coin in/out (cetus adapter, value-conserved).
+public fun cetus_swap(): u8 { 4 }
