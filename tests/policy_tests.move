@@ -125,6 +125,100 @@ fun test_per_tx_cap_zero_is_optional() {
     ts::end(scenario);
 }
 
+/// T1: with per_tx=0 (no per-tx sub-limit), a near-u64::MAX amount must abort
+/// with the clean ECapExceededPerDay, not a raw arithmetic-overflow error.
+#[test]
+#[expected_failure(abort_code = ::altheia::policy::ECapExceededPerDay)]
+fun test_check_and_consume_daily_overflow_is_clean_cap_error() {
+    let (mut scenario, owner, clk) = setup_with_caps(0, 500);
+    ts::next_tx(&mut scenario, AGENT);
+    let cap = ts::take_from_sender<AgentCap>(&scenario);
+    let mut p = ts::take_shared<Policy>(&scenario);
+    policy::check_and_consume<SUI>(&mut p, &cap, 100, ALLOWED_PKG, &clk);
+    policy::check_and_consume<SUI>(&mut p, &cap, 18446744073709551615, ALLOWED_PKG, &clk);
+    test_utils::destroy(cap);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    test_utils::destroy(owner);
+    ts::end(scenario);
+}
+
+/// T2: re-setting an existing asset cap must preserve cumulative spent_today,
+/// so an operator (or a compromised operator key) cannot reset the daily
+/// budget by re-issuing the cap mid-day.
+#[test]
+fun test_add_asset_cap_reset_preserves_spent_today() {
+    let (mut scenario, owner, clk) = setup_with_caps(100, 500);
+    ts::next_tx(&mut scenario, AGENT);
+    {
+        let cap = ts::take_from_sender<AgentCap>(&scenario);
+        let mut p = ts::take_shared<Policy>(&scenario);
+        policy::check_and_consume<SUI>(&mut p, &cap, 50, ALLOWED_PKG, &clk);
+        test_utils::destroy(cap);
+        ts::return_shared(p);
+    };
+    ts::next_tx(&mut scenario, OPERATOR);
+    {
+        let v = ts::take_shared<Vault>(&scenario);
+        let mut p = ts::take_shared<Policy>(&scenario);
+        vault::add_asset_cap<SUI>(&v, &owner, &mut p, 200, 1000, &clk);
+        assert!(policy::spent_today<SUI>(&p) == 50, 0);
+        ts::return_shared(v);
+        ts::return_shared(p);
+    };
+    clock::destroy_for_testing(clk);
+    test_utils::destroy(owner);
+    ts::end(scenario);
+}
+
+/// T4: the value guard must reject nonsense params (slippage > 100%, or a
+/// zero base_scalar that would divide-by-zero in the floor math).
+#[test]
+#[expected_failure(abort_code = ::altheia::policy::EInvalidValueGuard)]
+fun test_value_guard_rejects_bps_over_10000() {
+    let (mut scenario, owner, clk) = setup_with_caps(100, 500);
+    ts::next_tx(&mut scenario, OPERATOR);
+    let v = ts::take_shared<Vault>(&scenario);
+    let mut p = ts::take_shared<Policy>(&scenario);
+    vault::admin_set_value_guard(&v, &owner, &mut p, 10001, 1_000_000_000, &clk);
+    ts::return_shared(v);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    test_utils::destroy(owner);
+    ts::end(scenario);
+}
+
+#[test]
+#[expected_failure(abort_code = ::altheia::policy::EInvalidValueGuard)]
+fun test_value_guard_rejects_zero_base_scalar() {
+    let (mut scenario, owner, clk) = setup_with_caps(100, 500);
+    ts::next_tx(&mut scenario, OPERATOR);
+    let v = ts::take_shared<Vault>(&scenario);
+    let mut p = ts::take_shared<Policy>(&scenario);
+    vault::admin_set_value_guard(&v, &owner, &mut p, 100, 0, &clk);
+    ts::return_shared(v);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    test_utils::destroy(owner);
+    ts::end(scenario);
+}
+
+#[test]
+fun test_value_guard_accepts_valid_params() {
+    let (mut scenario, owner, clk) = setup_with_caps(100, 500);
+    ts::next_tx(&mut scenario, OPERATOR);
+    let v = ts::take_shared<Vault>(&scenario);
+    let mut p = ts::take_shared<Policy>(&scenario);
+    vault::admin_set_value_guard(&v, &owner, &mut p, 100, 1_000_000_000, &clk);
+    assert!(policy::max_slippage_bps(&p) == 100, 0);
+    assert!(policy::base_scalar(&p) == 1_000_000_000, 1);
+    ts::return_shared(v);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    test_utils::destroy(owner);
+    ts::end(scenario);
+}
+
 #[test]
 fun test_allowlist_allows_and_denies() {
     let (mut scenario, owner, clk) = setup_with_caps(100, 500);

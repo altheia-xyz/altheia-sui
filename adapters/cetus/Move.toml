@@ -1,0 +1,19 @@
+[package]
+name = "altheia_cetus"
+edition = "2024.beta"
+version = "0.1.0"
+license = "Proprietary"
+authors = ["altheia-xyz <hi@altheia.xyz>"]
+
+# Second entry in the altheia adapter catalog. Venue glue for Cetus CLMM:
+# closes the core hot-potato receipt with the CetusWitness after a flash-swap.
+# Cetus's flash_swap does NO slippage check by design, so altheia's value floor
+# (consume_with_check min_out) IS the slippage guard. Same shape as the DeepBook
+# adapter; the protocol-agnostic core never depends on any venue.
+
+[dependencies]
+altheia_sui = { local = "../.." }
+CetusClmm = { git = "https://github.com/CetusProtocol/cetus-clmm-interface.git", subdir = "sui/cetus_clmm", rev = "testnet-v1.26.0" }
+
+[addresses]
+altheia_cetus = "0x0"

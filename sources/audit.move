@@ -21,16 +21,6 @@ public struct AllowedAction has copy, drop {
     timestamp_ms: u64,
 }
 
-/// Emitted when an agent's action is denied by policy.
-public struct DeniedAction has copy, drop {
-    agent_id: vector<u8>,
-    policy_version: u64,
-    amount: u64,
-    target_package: address,
-    rule_id: vector<u8>,
-    timestamp_ms: u64,
-}
-
 /// Emitted when a policy is revoked. Once seen, the agent is dead.
 public struct PolicyRevoked has copy, drop {
     agent_id: vector<u8>,
@@ -38,9 +28,12 @@ public struct PolicyRevoked has copy, drop {
     timestamp_ms: u64,
 }
 
-/// Emitted when a policy is updated (caps, scope, pause/unpause).
-public struct PolicyUpdated has copy, drop {
+/// Discriminated policy-change event for every owner mutation. `kind`
+/// distinguishes the change classes (pause vs unpause vs cap vs value-guard vs
+/// action-set), so indexers can tell them apart without diffing object state.
+public struct PolicyChanged has copy, drop {
     agent_id: vector<u8>,
+    kind: u8,
     policy_version_before: u64,
     policy_version_after: u64,
     timestamp_ms: u64,
@@ -76,24 +69,6 @@ public(package) fun emit_allowed(
     });
 }
 
-public(package) fun emit_denied(
-    agent_id: vector<u8>,
-    policy_version: u64,
-    amount: u64,
-    target_package: address,
-    rule_id: vector<u8>,
-    timestamp_ms: u64,
-) {
-    event::emit(DeniedAction {
-        agent_id,
-        policy_version,
-        amount,
-        target_package,
-        rule_id,
-        timestamp_ms,
-    });
-}
-
 public(package) fun emit_revoked(
     agent_id: vector<u8>,
     policy_version: u64,
@@ -106,14 +81,25 @@ public(package) fun emit_revoked(
     });
 }
 
-public(package) fun emit_updated(
+// PolicyChanged discriminants. Public so the policy module (and indexers) name
+// them instead of bare integers; mirrors the `actions::*` id convention.
+public fun kind_pause(): u8 { 1 }
+public fun kind_unpause(): u8 { 2 }
+public fun kind_cap(): u8 { 3 }
+public fun kind_value_guard(): u8 { 4 }
+public fun kind_actions(): u8 { 5 }
+public fun kind_action_params(): u8 { 6 }
+
+public(package) fun emit_changed(
     agent_id: vector<u8>,
+    kind: u8,
     policy_version_before: u64,
     policy_version_after: u64,
     timestamp_ms: u64,
 ) {
-    event::emit(PolicyUpdated {
+    event::emit(PolicyChanged {
         agent_id,
+        kind,
         policy_version_before,
         policy_version_after,
         timestamp_ms,

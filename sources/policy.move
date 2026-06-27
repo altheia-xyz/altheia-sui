@@ -30,6 +30,10 @@ public struct AssetCap has store, copy, drop {
 /// Per-agent policy object. Shared at mint via vault::mint_policy*.
 public struct Policy has key {
     id: UID,
+    // The vault this policy governs. Bound at mint; every owner-gated mutation
+    // asserts the policy belongs to the vault, so an operator cannot touch
+    // another vault's policy (cross-vault tampering).
+    vault_id: ID,
     agent_id: vector<u8>,
     // Per-asset caps keyed by coin TypeName. An asset absent here is denied.
     caps: VecMap<TypeName, AssetCap>,
@@ -57,8 +61,10 @@ const EWrongPolicy: u64 = 7;
 const ENotAllowedAction: u64 = 8;
 const EActionConfigMissing: u64 = 9;
 const EAssetNotAllowed: u64 = 10;
+const EInvalidValueGuard: u64 = 11;
 
 const MS_PER_DAY: u64 = 86_400_000;
+const BPS_DENOM: u64 = 10_000;
 
 /// Build a VecSet from a vector of action ids (dedupes).
 fun actions_set(ids: vector<u8>): VecSet<u8> {
@@ -77,6 +83,7 @@ fun actions_set(ids: vector<u8>): VecSet<u8> {
 
 /// New policy with NO asset caps yet — add them with `add_asset_cap<T>`.
 public(package) fun new(
+    vault_id: ID,
     agent_id: vector<u8>,
     allowed_packages: vector<address>,
     allowed_actions: vector<u8>,
@@ -85,6 +92,7 @@ public(package) fun new(
 ): Policy {
     Policy {
         id: object::new(ctx),
+        vault_id,
         agent_id,
         caps: vec_map::empty<TypeName, AssetCap>(),
         allowed_packages,
@@ -107,18 +115,24 @@ public(package) fun add_asset_cap<T>(
 ) {
     let tn = type_name::get<T>();
     let now = clock::timestamp_ms(clock);
-    if (policy.caps.contains(&tn)) {
-        let (_, _) = policy.caps.remove(&tn);
+    // Preserve cumulative spend + window on re-set: re-issuing a cap mid-day
+    // must not reset the daily budget (else a compromised operator key could
+    // wipe spent_today at will). A new asset starts fresh at `now`.
+    let (spent_today, day_window_started_ms) = if (policy.caps.contains(&tn)) {
+        let (_, old) = policy.caps.remove(&tn);
+        (old.spent_today, old.day_window_started_ms)
+    } else {
+        (0, now)
     };
     policy.caps.insert(tn, AssetCap {
         per_tx_cap,
         per_day_cap,
-        spent_today: 0,
-        day_window_started_ms: now,
+        spent_today,
+        day_window_started_ms,
     });
     let before = policy.version;
     policy.version = before + 1;
-    audit::emit_updated(policy.agent_id, before, policy.version, now);
+    audit::emit_changed(policy.agent_id, audit::kind_cap(), before, policy.version, now);
 }
 
 /// Share a by-value Policy (PTB-end step for `vault::mint_policy_*`). Policy is
@@ -138,7 +152,9 @@ public(package) fun set_paused(policy: &mut Policy, paused: bool, clock: &Clock)
     let before = policy.version;
     policy.paused = paused;
     policy.version = before + 1;
-    audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
+    let now = clock::timestamp_ms(clock);
+    let kind = if (paused) audit::kind_pause() else audit::kind_unpause();
+    audit::emit_changed(policy.agent_id, kind, before, policy.version, now);
 }
 
 /// Operator-set value-guard params (per swap value conservation).
@@ -148,11 +164,16 @@ public(package) fun set_value_guard(
     base_scalar: u64,
     clock: &Clock,
 ) {
+    // Slippage is a fraction of BPS_DENOM (>100% is meaningless); base_scalar is
+    // a divisor in the floor math, so zero would divide-by-zero.
+    assert!(max_slippage_bps <= BPS_DENOM, EInvalidValueGuard);
+    assert!(base_scalar > 0, EInvalidValueGuard);
     let before = policy.version;
     policy.max_slippage_bps = max_slippage_bps;
     policy.base_scalar = base_scalar;
     policy.version = before + 1;
-    audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
+    let now = clock::timestamp_ms(clock);
+    audit::emit_changed(policy.agent_id, audit::kind_value_guard(), before, policy.version, now);
 }
 
 // === Liveness gate (for actions that don't move Vault funds) ===
@@ -199,9 +220,12 @@ public(package) fun check_and_consume<T>(
             c.day_window_started_ms = now;
             c.spent_today = 0;
         };
-        let new_spent = c.spent_today + amount;
-        assert!(new_spent <= c.per_day_cap, ECapExceededPerDay);
-        c.spent_today = new_spent;
+        // Checked: with per_tx_cap == 0 the amount is otherwise unbounded, so a
+        // near-u64::MAX amount would overflow `spent_today + amount` and abort
+        // with a raw arithmetic error instead of the clean cap error. The
+        // invariant spent_today <= per_day_cap keeps the subtraction safe.
+        assert!(amount <= c.per_day_cap - c.spent_today, ECapExceededPerDay);
+        c.spent_today = c.spent_today + amount;
     };
     // uncapped: position unwind — allowed, no accounting (proceeds re-vault).
 
@@ -220,7 +244,8 @@ public(package) fun set_allowed_actions(policy: &mut Policy, ids: vector<u8>, cl
     let before = policy.version;
     policy.allowed_actions = actions_set(ids);
     policy.version = before + 1;
-    audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
+    let now = clock::timestamp_ms(clock);
+    audit::emit_changed(policy.agent_id, audit::kind_actions(), before, policy.version, now);
 }
 
 // === Per-action config (dynamic fields, operator-set) ===
@@ -232,7 +257,7 @@ public(package) fun set_action_params(policy: &mut Policy, action: u8, params: v
     df::add(&mut policy.id, action, params);
     let before = policy.version;
     policy.version = before + 1;
-    audit::emit_updated(policy.agent_id, before, policy.version, clock::timestamp_ms(clock));
+    audit::emit_changed(policy.agent_id, audit::kind_action_params(), before, policy.version, clock::timestamp_ms(clock));
 }
 
 public fun action_params(policy: &Policy, action: u8): vector<u64> {
@@ -257,6 +282,7 @@ public fun assert_allows(policy: &Policy, action: u8) {
 // === Accessors ===
 
 public fun version(policy: &Policy): u64 { policy.version }
+public fun policy_vault_id(policy: &Policy): ID { policy.vault_id }
 public fun is_revoked(policy: &Policy): bool { policy.revoked }
 public fun is_paused(policy: &Policy): bool { policy.paused }
 public fun agent_id(policy: &Policy): vector<u8> { policy.agent_id }

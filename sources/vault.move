@@ -59,6 +59,15 @@ fun take_balance<T>(vault: &mut Vault, amount: u64): Balance<T> {
     balance::split(b, amount)
 }
 
+/// Guard for every owner-gated policy mutation: the OwnerCap controls this vault
+/// AND the policy belongs to this vault. The second check is what stops an
+/// operator from touching another vault's policy (cross-vault tampering) — the
+/// admin path has no AgentCap to bind vault+policy the way withdraw does.
+fun assert_admin(vault: &Vault, owner: &OwnerCap, policy: &Policy) {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    assert!(policy::policy_vault_id(policy) == object::id(vault), EWrongVault);
+}
+
 // === Provisioning (single-PTB, return-by-value) ===
 
 /// Provision a multi-asset vault, returning it + the OwnerCap by value for
@@ -81,9 +90,18 @@ public fun share_vault(vault: Vault) {
     transfer::share_object(vault);
 }
 
-/// Deposit any coin. Anyone can deposit; only the gated path withdraws. Records
-/// the type in `assets` on first deposit (incl. swap settlements).
-public fun deposit<T>(vault: &mut Vault, coin: Coin<T>) {
+/// Owner funds the vault.
+public fun admin_deposit<T>(vault: &mut Vault, owner: &OwnerCap, coin: Coin<T>) {
+    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    deposit_balance(vault, coin.into_balance());
+}
+
+/// Settle funds INTO the vault on behalf of an agent — swap adapters re-vault
+/// proceeds here. Cap-gated so only an agent bound to THIS vault can add assets;
+/// a third party cannot grief the vault by depositing junk coin types (which
+/// would bloat the `assets` enumeration the owner's drain walks).
+public fun deposit_for<T>(vault: &mut Vault, cap: &AgentCap, coin: Coin<T>) {
+    assert!(agent::vault_id(cap) == object::id(vault), EWrongVault);
     deposit_balance(vault, coin.into_balance());
 }
 
@@ -99,7 +117,7 @@ public fun mint_policy_open(
     ctx: &mut TxContext,
 ): Policy {
     assert!(owner.vault_id == object::id(vault), EWrongVault);
-    policy::new(agent_id, allowed_packages, allowed_actions, expires_at_ms, ctx)
+    policy::new(object::id(vault), agent_id, allowed_packages, allowed_actions, expires_at_ms, ctx)
 }
 
 /// Owner adds/replaces the per-asset cap for `T` on a policy.
@@ -111,7 +129,7 @@ public fun add_asset_cap<T>(
     per_day_cap: u64,
     clock: &Clock,
 ) {
-    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    assert_admin(vault, owner, policy);
     policy::add_asset_cap<T>(policy, per_tx_cap, per_day_cap, clock);
 }
 
@@ -124,39 +142,39 @@ public fun mint_agent_cap_for(
     agent_addr: address,
     ctx: &mut TxContext,
 ) {
-    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    assert_admin(vault, owner, policy);
     agent::mint_and_transfer(agent_id, object::id(vault), object::id(policy), agent_addr, ctx);
 }
 
 // === Admin (owner-gated policy mutations) ===
 
 public fun admin_revoke_policy(vault: &Vault, owner: &OwnerCap, policy: &mut Policy, clock: &Clock) {
-    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    assert_admin(vault, owner, policy);
     policy::set_revoked(policy, clock);
 }
 
 public fun admin_pause_policy(vault: &Vault, owner: &OwnerCap, policy: &mut Policy, clock: &Clock) {
-    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    assert_admin(vault, owner, policy);
     policy::set_paused(policy, true, clock);
 }
 
 public fun admin_unpause_policy(vault: &Vault, owner: &OwnerCap, policy: &mut Policy, clock: &Clock) {
-    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    assert_admin(vault, owner, policy);
     policy::set_paused(policy, false, clock);
 }
 
 public fun admin_set_actions(vault: &Vault, owner: &OwnerCap, policy: &mut Policy, allowed_actions: vector<u8>, clock: &Clock) {
-    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    assert_admin(vault, owner, policy);
     policy::set_allowed_actions(policy, allowed_actions, clock);
 }
 
 public fun admin_set_action_params(vault: &Vault, owner: &OwnerCap, policy: &mut Policy, action: u8, params: vector<u64>, clock: &Clock) {
-    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    assert_admin(vault, owner, policy);
     policy::set_action_params(policy, action, params, clock);
 }
 
 public fun admin_set_value_guard(vault: &Vault, owner: &OwnerCap, policy: &mut Policy, max_slippage_bps: u64, base_scalar: u64, clock: &Clock) {
-    assert!(owner.vault_id == object::id(vault), EWrongVault);
+    assert_admin(vault, owner, policy);
     policy::set_value_guard(policy, max_slippage_bps, base_scalar, clock);
 }
 
