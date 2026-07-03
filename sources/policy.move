@@ -1,42 +1,58 @@
 /// altheia::policy
 ///
-/// Per-agent policy as a SHARED object. Holds PER-ASSET caps + scope +
-/// cumulative spend state. Because Policy is shared, cumulative daily spend
-/// persists across transactions, so caps cannot be bypassed by splitting a
-/// spend across multiple PTBs.
+/// Per-agent policy as a SHARED object. The core struct holds only venue-agnostic
+/// INVARIANTS (identity, vault binding, lifecycle, scope, version). All
+/// adapter-specific bounds live in DYNAMIC-FIELD policy modules built from the
+/// generic `policy_module` primitives — so new adapters plug in without ever
+/// changing this struct. See altheia-plan/01_PHASES/sui/POLICY_MODULE_DESIGN.md.
 ///
-/// Multi-asset model: an agent's vault holds many coin types; the policy
-/// carries one `AssetCap` per type (keyed by TypeName). `check_and_consume<T>`
-/// is the enforcement gate, called by vault::withdraw_with_receipt<T> before
-/// any Coin<T> leaves the vault. An asset with no cap entry is default-deny.
+/// Spend caps are the first module: one `SpendModule` per capped asset (keyed by
+/// TypeName), a per-tx ceiling + a FLOW `BoundedCounter` for the rolling-day cap.
+/// Because Policy is shared, cumulative daily spend persists across transactions,
+/// so caps can't be bypassed by splitting a spend across PTBs. An asset with no
+/// SpendModule is uncapped (a position that may be unwound, never transferred out).
+/// `check_and_consume<T>` is the enforcement gate, called by
+/// vault::withdraw_with_receipt<T> before any Coin<T> leaves the vault.
 module altheia::policy;
 
 use sui::clock::{Self, Clock};
 use sui::vec_set::{Self, VecSet};
-use sui::vec_map::{Self, VecMap};
 use sui::dynamic_field as df;
 use std::type_name::{Self, TypeName};
 use altheia::agent::{Self, AgentCap};
 use altheia::audit;
+use altheia::policy_module::{Self as pm, BoundedCounter};
 
-/// Per-asset spend cap + rolling-day state.
-public struct AssetCap has store, copy, drop {
-    per_tx_cap: u64,
-    per_day_cap: u64,
-    spent_today: u64,
-    day_window_started_ms: u64,
+// === Policy modules (dynamic-field bounds; keyed off the core struct) ===
+
+/// Per-asset spend bound: per-tx ceiling (0 = no per-tx limit) + a FLOW counter
+/// for the rolling-day cap.
+public struct SpendModule has store, drop {
+    per_tx: u64,
+    day: BoundedCounter,
 }
+public struct SpendKey has copy, drop, store { asset: TypeName }
+
+/// Operator-set value-guard params (per swap value conservation).
+public struct ValueGuard has store, drop {
+    max_slippage_bps: u64,
+    base_scalar: u64,
+}
+public struct ValueGuardKey has copy, drop, store {}
+
+/// Per-asset debt bound: a STOCK counter (borrow ↑ / repay ↓ against a ceiling).
+/// Self-contained — Scallop's own oracle-based health factor / liquidation is
+/// separate and enforced by Scallop; this is altheia's hard borrow ceiling.
+public struct DebtModule has store, drop { ceiling: BoundedCounter }
+public struct DebtKey has copy, drop, store { asset: TypeName }
 
 /// Per-agent policy object. Shared at mint via vault::mint_policy*.
 public struct Policy has key {
     id: UID,
     // The vault this policy governs. Bound at mint; every owner-gated mutation
-    // asserts the policy belongs to the vault, so an operator cannot touch
-    // another vault's policy (cross-vault tampering).
+    // asserts the policy belongs to the vault (cross-vault tampering).
     vault_id: ID,
     agent_id: vector<u8>,
-    // Per-asset caps keyed by coin TypeName. An asset absent here is denied.
-    caps: VecMap<TypeName, AssetCap>,
     allowed_packages: vector<address>,
     // Capability allowlist (altheia::actions ids). Default-deny.
     allowed_actions: VecSet<u8>,
@@ -44,9 +60,6 @@ public struct Policy has key {
     revoked: bool,
     paused: bool,
     version: u64,
-    // Value-guard params (operator-set; agent cannot supply them).
-    max_slippage_bps: u64,
-    base_scalar: u64,
 }
 
 // === Errors ===
@@ -62,6 +75,8 @@ const ENotAllowedAction: u64 = 8;
 const EActionConfigMissing: u64 = 9;
 const EAssetNotAllowed: u64 = 10;
 const EInvalidValueGuard: u64 = 11;
+const EBorrowNotAllowed: u64 = 12;
+const EBorrowCapExceeded: u64 = 13;
 
 const MS_PER_DAY: u64 = 86_400_000;
 const BPS_DENOM: u64 = 10_000;
@@ -94,42 +109,33 @@ public(package) fun new(
         id: object::new(ctx),
         vault_id,
         agent_id,
-        caps: vec_map::empty<TypeName, AssetCap>(),
         allowed_packages,
         allowed_actions: actions_set(allowed_actions),
         expires_at_ms,
         revoked: false,
         paused: false,
         version: 1,
-        max_slippage_bps: 0,
-        base_scalar: 0,
     }
 }
 
-/// Add or replace the cap for asset `T`. Owner-gated via the vault front-door.
+/// Add or replace the spend cap for asset `T`. Owner-gated via the vault
+/// front-door. Re-setting preserves the accumulated day counter (current +
+/// window) — re-issuing a cap mid-day must not reset the daily budget.
 public(package) fun add_asset_cap<T>(
     policy: &mut Policy,
     per_tx_cap: u64,
     per_day_cap: u64,
     clock: &Clock,
 ) {
-    let tn = type_name::get<T>();
+    let key = SpendKey { asset: type_name::get<T>() };
     let now = clock::timestamp_ms(clock);
-    // Preserve cumulative spend + window on re-set: re-issuing a cap mid-day
-    // must not reset the daily budget (else a compromised operator key could
-    // wipe spent_today at will). A new asset starts fresh at `now`.
-    let (spent_today, day_window_started_ms) = if (policy.caps.contains(&tn)) {
-        let (_, old) = policy.caps.remove(&tn);
-        (old.spent_today, old.day_window_started_ms)
+    let day = if (df::exists_(&policy.id, key)) {
+        let old: SpendModule = df::remove(&mut policy.id, key);
+        pm::preserve(&old.day, per_day_cap) // old drops (has drop)
     } else {
-        (0, now)
+        pm::new_flow(per_day_cap, MS_PER_DAY, now)
     };
-    policy.caps.insert(tn, AssetCap {
-        per_tx_cap,
-        per_day_cap,
-        spent_today,
-        day_window_started_ms,
-    });
+    df::add(&mut policy.id, key, SpendModule { per_tx: per_tx_cap, day });
     let before = policy.version;
     policy.version = before + 1;
     audit::emit_changed(policy.agent_id, audit::kind_cap(), before, policy.version, now);
@@ -157,7 +163,8 @@ public(package) fun set_paused(policy: &mut Policy, paused: bool, clock: &Clock)
     audit::emit_changed(policy.agent_id, kind, before, policy.version, now);
 }
 
-/// Operator-set value-guard params (per swap value conservation).
+/// Operator-set value-guard params (per swap value conservation). Stored as a
+/// dynamic-field module, not a core struct field.
 public(package) fun set_value_guard(
     policy: &mut Policy,
     max_slippage_bps: u64,
@@ -168,12 +175,13 @@ public(package) fun set_value_guard(
     // a divisor in the floor math, so zero would divide-by-zero.
     assert!(max_slippage_bps <= BPS_DENOM, EInvalidValueGuard);
     assert!(base_scalar > 0, EInvalidValueGuard);
+    if (df::exists_(&policy.id, ValueGuardKey {})) {
+        let _: ValueGuard = df::remove(&mut policy.id, ValueGuardKey {});
+    };
+    df::add(&mut policy.id, ValueGuardKey {}, ValueGuard { max_slippage_bps, base_scalar });
     let before = policy.version;
-    policy.max_slippage_bps = max_slippage_bps;
-    policy.base_scalar = base_scalar;
     policy.version = before + 1;
-    let now = clock::timestamp_ms(clock);
-    audit::emit_changed(policy.agent_id, audit::kind_value_guard(), before, policy.version, now);
+    audit::emit_changed(policy.agent_id, audit::kind_value_guard(), before, policy.version, clock::timestamp_ms(clock));
 }
 
 // === Liveness gate (for actions that don't move Vault funds) ===
@@ -192,10 +200,8 @@ public fun assert_active(policy: &Policy, cap: &AgentCap, clock: &Clock) {
 /// the vault may hold:
 ///   - Capped (budget) asset → enforce per_tx/per_day + record the spend.
 ///   - Uncapped asset → a POSITION acquired via a prior permitted swap; allowed
-///     to be sold/swapped back without a cap, because swap proceeds settle into
-///     the vault (the receipt guarantees re-vaulting) and selling reduces risk.
-/// Exfiltration (transfer OUT) is gated separately by `assert_transferable<T>`,
-/// so a position asset can be unwound but never transferred straight out.
+///     to be sold/swapped back without a cap (proceeds re-vault, selling reduces
+///     risk). Exfiltration OUT is gated separately by `assert_transferable<T>`.
 public(package) fun check_and_consume<T>(
     policy: &mut Policy,
     cap: &AgentCap,
@@ -211,21 +217,15 @@ public(package) fun check_and_consume<T>(
     assert!(now < policy.expires_at_ms, EPolicyExpired);
     assert!(policy.allowed_packages.contains(&target_package), EPackageNotAllowed);
 
-    let tn = type_name::get<T>();
-    if (policy.caps.contains(&tn)) {
+    let key = SpendKey { asset: type_name::get<T>() };
+    if (df::exists_(&policy.id, key)) {
         // budget asset: enforce caps + record the spend
-        let c = policy.caps.get_mut(&tn);
-        if (c.per_tx_cap > 0) assert!(amount <= c.per_tx_cap, ECapExceededPerTx);
-        if (now >= c.day_window_started_ms + MS_PER_DAY) {
-            c.day_window_started_ms = now;
-            c.spent_today = 0;
-        };
-        // Checked: with per_tx_cap == 0 the amount is otherwise unbounded, so a
-        // near-u64::MAX amount would overflow `spent_today + amount` and abort
-        // with a raw arithmetic error instead of the clean cap error. The
-        // invariant spent_today <= per_day_cap keeps the subtraction safe.
-        assert!(amount <= c.per_day_cap - c.spent_today, ECapExceededPerDay);
-        c.spent_today = c.spent_today + amount;
+        let sm = df::borrow_mut<SpendKey, SpendModule>(&mut policy.id, key);
+        if (sm.per_tx > 0) assert!(amount <= sm.per_tx, ECapExceededPerTx);
+        // per-day via the FLOW counter, but keep the distinct per-day abort code:
+        // would_exceed does the window-roll math without mutating.
+        assert!(!pm::would_exceed(&sm.day, amount, now), ECapExceededPerDay);
+        pm::consume(&mut sm.day, amount, now);
     };
     // uncapped: position unwind — allowed, no accounting (proceeds re-vault).
 
@@ -233,10 +233,72 @@ public(package) fun check_and_consume<T>(
 }
 
 /// Exfiltration gate: an asset may only be transferred OUT of the vault if the
-/// operator gave it a cap. Position assets (uncapped) can be sold back but never
-/// transferred to an external address. The transfer action path calls this.
+/// operator gave it a spend cap. Position assets (uncapped) can be sold back but
+/// never transferred to an external address. The transfer action path calls this.
 public fun assert_transferable<T>(policy: &Policy) {
-    assert!(policy.caps.contains(&type_name::get<T>()), EAssetNotAllowed);
+    assert!(df::exists_(&policy.id, SpendKey { asset: type_name::get<T>() }), EAssetNotAllowed);
+}
+
+// === Debt module (lending) — the STOCK case, first consumer of the base ===
+
+/// Set/replace the borrow ceiling for asset `T` (owner-gated via vault). STOCK
+/// counter — re-setting preserves outstanding borrowed (can't wipe debt by
+/// re-issuing the cap). ceiling 0 = borrowing this asset is disabled.
+public(package) fun set_debt_cap<T>(policy: &mut Policy, ceiling: u64, clock: &Clock) {
+    let key = DebtKey { asset: type_name::get<T>() };
+    let bc = if (df::exists_(&policy.id, key)) {
+        let old: DebtModule = df::remove(&mut policy.id, key);
+        pm::preserve(&old.ceiling, ceiling)
+    } else {
+        pm::new_stock(ceiling)
+    };
+    df::add(&mut policy.id, key, DebtModule { ceiling: bc });
+    let before = policy.version;
+    policy.version = before + 1;
+    audit::emit_changed(policy.agent_id, audit::kind_cap(), before, policy.version, clock::timestamp_ms(clock));
+}
+
+/// Enforce + record a borrow of `amount` of `T`: liveness + the debt ceiling.
+/// Default-deny — an asset with no debt module cannot be borrowed.
+public(package) fun consume_debt<T>(
+    policy: &mut Policy,
+    cap: &AgentCap,
+    amount: u64,
+    target_package: address,
+    clock: &Clock,
+) {
+    assert!(agent::policy_id(cap) == object::id(policy), EWrongPolicy);
+    assert!(!policy.revoked, EPolicyRevoked);
+    assert!(!policy.paused, EPolicyPaused);
+    let now = clock::timestamp_ms(clock);
+    assert!(now < policy.expires_at_ms, EPolicyExpired);
+    let key = DebtKey { asset: type_name::get<T>() };
+    assert!(df::exists_(&policy.id, key), EBorrowNotAllowed);
+    let dm = df::borrow_mut<DebtKey, DebtModule>(&mut policy.id, key);
+    assert!(!pm::would_exceed(&dm.ceiling, amount, now), EBorrowCapExceeded);
+    pm::consume(&mut dm.ceiling, amount, now);
+    audit::emit_allowed(policy.agent_id, policy.version, amount, target_package, now);
+}
+
+/// Release `amount` of outstanding debt for `T` (repay). Saturating.
+public(package) fun release_debt<T>(policy: &mut Policy, amount: u64) {
+    let key = DebtKey { asset: type_name::get<T>() };
+    if (df::exists_(&policy.id, key)) {
+        let dm = df::borrow_mut<DebtKey, DebtModule>(&mut policy.id, key);
+        pm::release(&mut dm.ceiling, amount);
+    };
+}
+
+public fun has_debt_cap<T>(policy: &Policy): bool {
+    df::exists_(&policy.id, DebtKey { asset: type_name::get<T>() })
+}
+public fun borrow_cap<T>(policy: &Policy): u64 {
+    let key = DebtKey { asset: type_name::get<T>() };
+    if (df::exists_(&policy.id, key)) { let dm = df::borrow<DebtKey, DebtModule>(&policy.id, key); pm::limit(&dm.ceiling) } else 0
+}
+public fun borrowed<T>(policy: &Policy): u64 {
+    let key = DebtKey { asset: type_name::get<T>() };
+    if (df::exists_(&policy.id, key)) { let dm = df::borrow<DebtKey, DebtModule>(&policy.id, key); pm::current(&dm.ceiling) } else 0
 }
 
 /// Replace the capability allowlist (owner-gated via vault::admin_set_actions).
@@ -286,30 +348,40 @@ public fun policy_vault_id(policy: &Policy): ID { policy.vault_id }
 public fun is_revoked(policy: &Policy): bool { policy.revoked }
 public fun is_paused(policy: &Policy): bool { policy.paused }
 public fun agent_id(policy: &Policy): vector<u8> { policy.agent_id }
-public fun max_slippage_bps(policy: &Policy): u64 { policy.max_slippage_bps }
-public fun base_scalar(policy: &Policy): u64 { policy.base_scalar }
 
-/// Does the policy carry a cap for asset `T`?
+public fun max_slippage_bps(policy: &Policy): u64 {
+    if (df::exists_(&policy.id, ValueGuardKey {})) {
+        df::borrow<ValueGuardKey, ValueGuard>(&policy.id, ValueGuardKey {}).max_slippage_bps
+    } else 0
+}
+public fun base_scalar(policy: &Policy): u64 {
+    if (df::exists_(&policy.id, ValueGuardKey {})) {
+        df::borrow<ValueGuardKey, ValueGuard>(&policy.id, ValueGuardKey {}).base_scalar
+    } else 0
+}
+
+/// Does the policy carry a spend cap for asset `T`?
 public fun has_asset_cap<T>(policy: &Policy): bool {
-    policy.caps.contains(&type_name::get<T>())
+    df::exists_(&policy.id, SpendKey { asset: type_name::get<T>() })
 }
 
 public fun per_tx_cap<T>(policy: &Policy): u64 {
-    let tn = type_name::get<T>();
-    if (policy.caps.contains(&tn)) policy.caps.get(&tn).per_tx_cap else 0
+    let key = SpendKey { asset: type_name::get<T>() };
+    if (df::exists_(&policy.id, key)) df::borrow<SpendKey, SpendModule>(&policy.id, key).per_tx else 0
 }
 
 public fun per_day_cap<T>(policy: &Policy): u64 {
-    let tn = type_name::get<T>();
-    if (policy.caps.contains(&tn)) policy.caps.get(&tn).per_day_cap else 0
+    let key = SpendKey { asset: type_name::get<T>() };
+    if (df::exists_(&policy.id, key)) {
+        let sm = df::borrow<SpendKey, SpendModule>(&policy.id, key);
+        pm::limit(&sm.day)
+    } else 0
 }
 
 public fun spent_today<T>(policy: &Policy): u64 {
-    let tn = type_name::get<T>();
-    if (policy.caps.contains(&tn)) policy.caps.get(&tn).spent_today else 0
-}
-
-/// Number of distinct assets with caps.
-public fun asset_count(policy: &Policy): u64 {
-    policy.caps.size()
+    let key = SpendKey { asset: type_name::get<T>() };
+    if (df::exists_(&policy.id, key)) {
+        let sm = df::borrow<SpendKey, SpendModule>(&policy.id, key);
+        pm::current(&sm.day)
+    } else 0
 }

@@ -219,6 +219,81 @@ fun test_value_guard_accepts_valid_params() {
     ts::end(scenario);
 }
 
+// === Debt module (lending, STOCK case) ===
+
+#[test]
+fun debt_borrow_to_ceiling_and_repay() {
+    let (mut scenario, owner, clk) = setup_with_caps(100, 500);
+    ts::next_tx(&mut scenario, AGENT);
+    let cap = ts::take_from_sender<AgentCap>(&scenario);
+    let mut p = ts::take_shared<Policy>(&scenario);
+    policy::set_debt_cap<SUI>(&mut p, 1000, &clk);
+    policy::consume_debt<SUI>(&mut p, &cap, 600, ALLOWED_PKG, &clk);
+    assert!(policy::borrowed<SUI>(&p) == 600, 0);
+    policy::consume_debt<SUI>(&mut p, &cap, 400, ALLOWED_PKG, &clk); // up to ceiling
+    assert!(policy::borrowed<SUI>(&p) == 1000, 1);
+    policy::release_debt<SUI>(&mut p, 300); // repay
+    assert!(policy::borrowed<SUI>(&p) == 700, 2);
+    policy::consume_debt<SUI>(&mut p, &cap, 300, ALLOWED_PKG, &clk); // re-borrow the freed room
+    assert!(policy::borrowed<SUI>(&p) == 1000, 3);
+    test_utils::destroy(cap);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    test_utils::destroy(owner);
+    ts::end(scenario);
+}
+
+#[test]
+#[expected_failure(abort_code = ::altheia::policy::EBorrowCapExceeded)]
+fun debt_over_ceiling_aborts() {
+    let (mut scenario, owner, clk) = setup_with_caps(100, 500);
+    ts::next_tx(&mut scenario, AGENT);
+    let cap = ts::take_from_sender<AgentCap>(&scenario);
+    let mut p = ts::take_shared<Policy>(&scenario);
+    policy::set_debt_cap<SUI>(&mut p, 1000, &clk);
+    policy::consume_debt<SUI>(&mut p, &cap, 1001, ALLOWED_PKG, &clk);
+    test_utils::destroy(cap);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    test_utils::destroy(owner);
+    ts::end(scenario);
+}
+
+// Default-deny: an asset with no debt cap cannot be borrowed.
+#[test]
+#[expected_failure(abort_code = ::altheia::policy::EBorrowNotAllowed)]
+fun debt_no_cap_aborts() {
+    let (mut scenario, owner, clk) = setup_with_caps(100, 500);
+    ts::next_tx(&mut scenario, AGENT);
+    let cap = ts::take_from_sender<AgentCap>(&scenario);
+    let mut p = ts::take_shared<Policy>(&scenario);
+    policy::consume_debt<SUI>(&mut p, &cap, 1, ALLOWED_PKG, &clk);
+    test_utils::destroy(cap);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    test_utils::destroy(owner);
+    ts::end(scenario);
+}
+
+// Re-setting the debt cap preserves outstanding borrowed (can't wipe debt).
+#[test]
+fun debt_cap_reset_preserves_borrowed() {
+    let (mut scenario, owner, clk) = setup_with_caps(100, 500);
+    ts::next_tx(&mut scenario, AGENT);
+    let cap = ts::take_from_sender<AgentCap>(&scenario);
+    let mut p = ts::take_shared<Policy>(&scenario);
+    policy::set_debt_cap<SUI>(&mut p, 1000, &clk);
+    policy::consume_debt<SUI>(&mut p, &cap, 500, ALLOWED_PKG, &clk);
+    policy::set_debt_cap<SUI>(&mut p, 2000, &clk);
+    assert!(policy::borrowed<SUI>(&p) == 500, 0);
+    assert!(policy::borrow_cap<SUI>(&p) == 2000, 1);
+    test_utils::destroy(cap);
+    ts::return_shared(p);
+    clock::destroy_for_testing(clk);
+    test_utils::destroy(owner);
+    ts::end(scenario);
+}
+
 #[test]
 fun test_allowlist_allows_and_denies() {
     let (mut scenario, owner, clk) = setup_with_caps(100, 500);
