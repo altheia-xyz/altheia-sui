@@ -178,6 +178,13 @@ public fun admin_set_value_guard(vault: &Vault, owner: &OwnerCap, policy: &mut P
     policy::set_value_guard(policy, max_slippage_bps, base_scalar, clock);
 }
 
+/// Operator registers the Seal unseal authority (device/runtime addr allowed to
+/// decrypt the agent's sealed key while the policy is live).
+public fun admin_set_seal_custody(vault: &Vault, owner: &OwnerCap, policy: &mut Policy, unseal_authority: address, clock: &Clock) {
+    assert_admin(vault, owner, policy);
+    policy::set_seal_custody(policy, unseal_authority, clock);
+}
+
 // === Withdraw (the agent gate) ===
 
 /// Withdraw `amount` of T for the agent. Returns (Coin<T>, WithdrawalReceipt) —

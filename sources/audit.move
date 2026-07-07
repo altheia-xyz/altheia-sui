@@ -89,6 +89,7 @@ public fun kind_cap(): u8 { 3 }
 public fun kind_value_guard(): u8 { 4 }
 public fun kind_actions(): u8 { 5 }
 public fun kind_action_params(): u8 { 6 }
+public fun kind_seal_custody(): u8 { 7 }
 
 public(package) fun emit_changed(
     agent_id: vector<u8>,

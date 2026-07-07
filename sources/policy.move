@@ -46,6 +46,12 @@ public struct ValueGuardKey has copy, drop, store {}
 public struct DebtModule has store, drop { ceiling: BoundedCounter }
 public struct DebtKey has copy, drop, store { asset: TypeName }
 
+/// Seal custody: the operator-registered address allowed to unseal the agent's
+/// Seal-encrypted key material via `seal_approve`, while the policy is live.
+/// Stored as a df module (not a core field) — custody is adapter-shaped state.
+public struct SealCustody has store, drop { unseal_authority: address }
+public struct SealKey has copy, drop, store {}
+
 /// Per-agent policy object. Shared at mint via vault::mint_policy*.
 public struct Policy has key {
     id: UID,
@@ -77,6 +83,7 @@ const EAssetNotAllowed: u64 = 10;
 const EInvalidValueGuard: u64 = 11;
 const EBorrowNotAllowed: u64 = 12;
 const EBorrowCapExceeded: u64 = 13;
+const ESealDenied: u64 = 14;
 
 const MS_PER_DAY: u64 = 86_400_000;
 const BPS_DENOM: u64 = 10_000;
@@ -184,15 +191,82 @@ public(package) fun set_value_guard(
     audit::emit_changed(policy.agent_id, audit::kind_value_guard(), before, policy.version, clock::timestamp_ms(clock));
 }
 
+/// Operator-set Seal unseal authority: the device/runtime address allowed to
+/// decrypt the agent's Seal-sealed key while the policy is live. Stored as a df
+/// module; re-set replaces. Revoke/pause/expiry make the key undecryptable.
+public(package) fun set_seal_custody(policy: &mut Policy, unseal_authority: address, clock: &Clock) {
+    if (df::exists_(&policy.id, SealKey {})) {
+        let _: SealCustody = df::remove(&mut policy.id, SealKey {});
+    };
+    df::add(&mut policy.id, SealKey {}, SealCustody { unseal_authority });
+    let before = policy.version;
+    policy.version = before + 1;
+    audit::emit_changed(policy.agent_id, audit::kind_seal_custody(), before, policy.version, clock::timestamp_ms(clock));
+}
+
 // === Liveness gate (for actions that don't move Vault funds) ===
 
-/// Assert the agent's policy is live: correct policy, not revoked/paused/expired.
-public fun assert_active(policy: &Policy, cap: &AgentCap, clock: &Clock) {
-    assert!(agent::policy_id(cap) == object::id(policy), EWrongPolicy);
+/// Assert the policy is live: not revoked/paused/expired. No AgentCap binding —
+/// for gates whose caller isn't the agent holding the cap (e.g. Seal unseal).
+public fun assert_live(policy: &Policy, clock: &Clock) {
     assert!(!policy.revoked, EPolicyRevoked);
     assert!(!policy.paused, EPolicyPaused);
     assert!(clock::timestamp_ms(clock) < policy.expires_at_ms, EPolicyExpired);
 }
+
+/// Assert the agent's policy is live: correct policy, not revoked/paused/expired.
+public fun assert_active(policy: &Policy, cap: &AgentCap, clock: &Clock) {
+    assert!(agent::policy_id(cap) == object::id(policy), EWrongPolicy);
+    assert_live(policy, clock);
+}
+
+// === Seal custody gate ===
+
+/// Pure authorization predicate for a Seal unseal request. True iff the policy
+/// is live, `id` is namespaced under this policy (prefixed by the policy object
+/// id), and `caller` is the operator-registered unseal authority. `seal_approve`
+/// asserts this; exposed as a bool for testing + off-chain dry-run parity.
+public fun seal_authorized(policy: &Policy, caller: address, id: vector<u8>, clock: &Clock): bool {
+    is_live(policy, clock)
+        && df::exists_(&policy.id, SealKey {})
+        && has_id_prefix(policy.id.to_bytes(), id)
+        && caller == seal_unseal_authority(policy)
+}
+
+/// Seal access-control entry point. Key servers dry-run this before releasing a
+/// decryption key share; ANY abort denies. Revoke/pause/expiry therefore make
+/// the agent's sealed key permanently undecryptable.
+entry fun seal_approve(id: vector<u8>, policy: &Policy, clock: &Clock, ctx: &TxContext) {
+    assert!(seal_authorized(policy, ctx.sender(), id, clock), ESealDenied);
+}
+
+/// True iff `id` begins with `prefix`.
+fun has_id_prefix(prefix: vector<u8>, id: vector<u8>): bool {
+    if (prefix.length() > id.length()) return false;
+    let mut i = 0;
+    while (i < prefix.length()) {
+        if (prefix[i] != id[i]) return false;
+        i = i + 1;
+    };
+    true
+}
+
+/// Boolean liveness (no abort codes) — used by `seal_authorized`.
+public fun is_live(policy: &Policy, clock: &Clock): bool {
+    !policy.revoked && !policy.paused && clock::timestamp_ms(clock) < policy.expires_at_ms
+}
+
+public fun has_seal_custody(policy: &Policy): bool { df::exists_(&policy.id, SealKey {}) }
+
+public fun seal_unseal_authority(policy: &Policy): address {
+    let c: &SealCustody = df::borrow(&policy.id, SealKey {});
+    c.unseal_authority
+}
+
+/// The policy object id as bytes — the prefix under which Seal ids are namespaced.
+public fun id_bytes(policy: &Policy): vector<u8> { policy.id.to_bytes() }
+
+public fun expires_at(policy: &Policy): u64 { policy.expires_at_ms }
 
 // === Enforcement gate ===
 
